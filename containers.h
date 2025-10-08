@@ -135,7 +135,6 @@ private:
     VMManager& operator=(const VMManager&) = delete;
 };
 
-
 template<typename T>
 class VMVector {
 public:
@@ -145,6 +144,78 @@ public:
     typedef T* pointer;
     typedef const T* const_pointer;
     typedef size_t size_type;
+    typedef ptrdiff_t difference_type;
+
+    // Random-access iterator implementation for VMVector
+    class iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = T;
+        using reference = T&;
+        using pointer = T*;
+        using difference_type = ptrdiff_t;
+
+        iterator(VMVector* vec, size_type pos) : _vec(vec), _pos(pos) {}
+
+        reference operator*() { return (*_vec)[_pos]; }
+        pointer operator->() { return &(*_vec)[_pos]; }
+        iterator& operator++() { ++_pos; return *this; }
+        iterator operator++(int) { iterator tmp = *this; ++_pos; return tmp; }
+        iterator& operator--() { --_pos; return *this; }
+        iterator operator--(int) { iterator tmp = *this; --_pos; return tmp; }
+        iterator& operator+=(difference_type n) { _pos += n; return *this; }
+        iterator& operator-=(difference_type n) { _pos -= n; return *this; }
+        iterator operator+(difference_type n) const { return iterator(_vec, _pos + n); }
+        iterator operator-(difference_type n) const { return iterator(_vec, _pos - n); }
+        difference_type operator-(const iterator& rhs) const { return _pos - rhs._pos; }
+        reference operator[](difference_type n) { return (*_vec)[_pos + n]; }
+        bool operator==(const iterator& other) const { return _vec == other._vec && _pos == other._pos; }
+        bool operator!=(const iterator& other) const { return !(*this == other); }
+        bool operator<(const iterator& other) const { return _pos < other._pos; }
+        bool operator>(const iterator& other) const { return _pos > other._pos; }
+        bool operator<=(const iterator& other) const { return _pos <= other._pos; }
+        bool operator>=(const iterator& other) const { return _pos >= other._pos; }
+
+    private:
+        VMVector* _vec;
+        size_type _pos;
+        friend class VMVector;
+    };
+
+    class const_iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = T;
+        using reference = const T&;
+        using pointer = const T*;
+        using difference_type = ptrdiff_t;
+
+        const_iterator(const VMVector* vec, size_type pos) : _vec(vec), _pos(pos) {}
+
+        reference operator*() const { return (*_vec)[_pos]; }
+        pointer operator->() const { return &(*_vec)[_pos]; }
+        const_iterator& operator++() { ++_pos; return *this; }
+        const_iterator operator++(int) { const_iterator tmp = *this; ++_pos; return tmp; }
+        const_iterator& operator--() { --_pos; return *this; }
+        const_iterator operator--(int) { const_iterator tmp = *this; --_pos; return tmp; }
+        const_iterator& operator+=(difference_type n) { _pos += n; return *this; }
+        const_iterator& operator-=(difference_type n) { _pos -= n; return *this; }
+        const_iterator operator+(difference_type n) const { return const_iterator(_vec, _pos + n); }
+        const_iterator operator-(difference_type n) const { return const_iterator(_vec, _pos - n); }
+        difference_type operator-(const const_iterator& rhs) const { return _pos - rhs._pos; }
+        reference operator[](difference_type n) const { return (*_vec)[_pos + n]; }
+        bool operator==(const const_iterator& other) const { return _vec == other._vec && _pos == other._pos; }
+        bool operator!=(const const_iterator& other) const { return !(*this == other); }
+        bool operator<(const const_iterator& other) const { return _pos < other._pos; }
+        bool operator>(const const_iterator& other) const { return _pos > other._pos; }
+        bool operator<=(const const_iterator& other) const { return _pos <= other._pos; }
+        bool operator>=(const const_iterator& other) const { return _pos >= other._pos; }
+
+    private:
+        const VMVector* _vec;
+        size_type _pos;
+        friend class VMVector;
+    };
 
     VMVector() : _chunk_capacity(VM_PAGE_SIZE / sizeof(T)), _size(0), _chunk_count(0) {
         for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
@@ -159,9 +230,51 @@ public:
         assign(ilist.begin(), ilist.end());
     }
 
+    // Copy constructor
+    VMVector(const VMVector& other) : VMVector() {
+        assign(other.begin(), other.end());
+    }
+
+    // Move constructor
+    VMVector(VMVector&& other) noexcept : _chunk_capacity(other._chunk_capacity), _size(other._size), _chunk_count(other._chunk_count) {
+        for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
+            _chunks[i] = other._chunks[i];
+            other._chunks[i].page_idx = -1;
+            other._chunks[i].count = 0;
+        }
+        other._size = 0;
+        other._chunk_count = 0;
+    }
+
+    // Copy assignment
+    VMVector& operator=(const VMVector& other) {
+        if (this != &other) {
+            clear();
+            assign(other.begin(), other.end());
+        }
+        return *this;
+    }
+
+    // Move assignment
+    VMVector& operator=(VMVector&& other) noexcept {
+        if (this != &other) {
+            clear();
+            _chunk_capacity = other._chunk_capacity;
+            _size = other._size;
+            _chunk_count = other._chunk_count;
+            for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
+                _chunks[i] = other._chunks[i];
+                other._chunks[i].page_idx = -1;
+                other._chunks[i].count = 0;
+            }
+            other._size = 0;
+            other._chunk_count = 0;
+        }
+        return *this;
+    }
+
     ~VMVector() { clear(); }
 
-    // Add element to the end of the vector
     void push_back(const T& value) {
         if (_chunk_count == 0 || _chunks[_chunk_count-1].count >= _chunk_capacity) {
             int page_idx;
@@ -176,7 +289,6 @@ public:
         ch.count++; _size++;
     }
 
-    // Remove element from the end of the vector
     void pop_back() {
         if (_size == 0) throw std::out_of_range("pop_back from empty VMVector");
         _size--;
@@ -207,11 +319,85 @@ public:
         return *reinterpret_cast<const T*>(VMManager::instance().get_ptr(ch.page_idx, offset * sizeof(T)));
     }
 
+    reference front() {
+        if (_size == 0) throw std::out_of_range("front from empty VMVector");
+        return (*this)[0];
+    }
+
+    const_reference front() const {
+        if (_size == 0) throw std::out_of_range("front from empty VMVector");
+        return (*this)[0];
+    }
+
+    reference back() {
+        if (_size == 0) throw std::out_of_range("back from empty VMVector");
+        return (*this)[_size - 1];
+    }
+
+    const_reference back() const {
+        if (_size == 0) throw std::out_of_range("back from empty VMVector");
+        return (*this)[_size - 1];
+    }
+
     bool empty() const { return _size == 0; }
     size_type size() const { return _size; }
     size_type capacity() const { return _chunk_count * _chunk_capacity; }
 
-    // Clear all elements from the vector
+    // Reserve memory for at least n elements (allocate enough pages)
+    void reserve(size_type n) {
+        size_type required_chunks = (n + _chunk_capacity - 1) / _chunk_capacity;
+        while (_chunk_count < required_chunks) {
+            int page_idx;
+            VMManager::instance().alloc_page(&page_idx, true);
+            _chunks[_chunk_count].page_idx = page_idx;
+            _chunks[_chunk_count].count = 0;
+            _chunk_count++;
+        }
+    }
+
+    // Reduces capacity to fit size (frees unused pages)
+    void shrink_to_fit() {
+        size_type used_chunks = (_size + _chunk_capacity - 1) / _chunk_capacity;
+        for (size_type i = used_chunks; i < _chunk_count; ++i) {
+            if (_chunks[i].page_idx != -1) {
+                VMManager::instance().swap_out(_chunks[i].page_idx);
+                _chunks[i].page_idx = -1;
+                _chunks[i].count = 0;
+            }
+        }
+        _chunk_count = used_chunks;
+    }
+
+    // Swap contents with another VMVector
+    void swap(VMVector& other) {
+        std::swap(_chunk_capacity, other._chunk_capacity);
+        std::swap(_size, other._size);
+        std::swap(_chunk_count, other._chunk_count);
+        for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
+            std::swap(_chunks[i], other._chunks[i]);
+        }
+    }
+
+    iterator insert(iterator pos, const T& value) {
+        size_type idx = pos - begin();
+        push_back(T());
+        for (size_type i = _size - 1; i > idx; --i) {
+            (*this)[i] = (*this)[i - 1];
+        }
+        (*this)[idx] = value;
+        return iterator(this, idx);
+    }
+
+    iterator erase(iterator pos) {
+        size_type idx = pos - begin();
+        if (idx >= _size) return end();
+        for (size_type i = idx; i < _size - 1; ++i) {
+            (*this)[i] = (*this)[i + 1];
+        }
+        pop_back();
+        return iterator(this, idx);
+    }
+
     void clear() {
         for (size_type i = 0; i < _chunk_count; ++i) {
             Chunk& ch = _chunks[i];
@@ -220,12 +406,13 @@ public:
                 ptr->~T();
             }
             VMManager::instance().swap_out(ch.page_idx); // free RAM!
+            ch.page_idx = -1;
+            ch.count = 0;
         }
         _chunk_count = 0;
         _size = 0;
     }
 
-    // Resize the vector
     void resize(size_type n, const T& val = T()) {
         if (n < _size) {
             while (_size > n) pop_back();
@@ -234,7 +421,6 @@ public:
         }
     }
 
-    // Assign n copies of val to the vector
     void assign(size_type n, const T& val) {
         clear();
         resize(n, val);
@@ -245,6 +431,33 @@ public:
         for (InputIt it = first; it != last; ++it) push_back(*it);
     }
 
+    iterator begin() { return iterator(this, 0); }
+    iterator end() { return iterator(this, _size); }
+    const_iterator begin() const { return const_iterator(this, 0); }
+    const_iterator end() const { return const_iterator(this, _size); }
+    const_iterator cbegin() const { return const_iterator(this, 0); }
+    const_iterator cend() const { return const_iterator(this, _size); }
+
+    bool operator==(const VMVector& other) const {
+        if (_size != other._size) return false;
+        for (size_type i = 0; i < _size; ++i) {
+            if ((*this)[i] != other[i]) return false;
+        }
+        return true;
+    }
+    bool operator!=(const VMVector& other) const { return !(*this == other); }
+    bool operator<(const VMVector& other) const {
+        size_type n = std::min(_size, other._size);
+        for (size_type i = 0; i < n; ++i) {
+            if ((*this)[i] < other[i]) return true;
+            if (other[i] < (*this)[i]) return false;
+        }
+        return _size < other._size;
+    }
+    bool operator>(const VMVector& other) const { return other < *this; }
+    bool operator<=(const VMVector& other) const { return !(other < *this); }
+    bool operator>=(const VMVector& other) const { return !(*this < other); }
+
 private:
     struct Chunk {
         int page_idx;
@@ -254,6 +467,9 @@ private:
     size_type _chunk_count;
     size_type _chunk_capacity;
     size_type _size;
+
+    friend class iterator;
+    friend class const_iterator;
 };
 
 // VMArray: std::array-like, frees RAM on swap
@@ -281,12 +497,10 @@ public:
     size_type size() const { return N; }
     bool empty() const { return N == 0; }
 
-    // Fill the array with a value
     void fill(const T& val) {
         for (size_type i = 0; i < N; ++i) (*this)[i] = val;
     }
 
-    // Clear the array and free RAM
     void clear() {
         for (size_type i = 0; i < N; ++i)
             (*this)[i] = T();
@@ -330,9 +544,6 @@ public:
         }
     }
 
-    // --- Main methods ---
-
-    // Assign a new string value
     void assign(const char* s) {
         size_t len = strlen(s);
         ensure_capacity(len + 1);
@@ -340,7 +551,6 @@ public:
         _size = len;
     }
 
-    // Clear the string and free RAM
     void clear() {
         if (_buf) {
             _buf[0] = '\0';
@@ -349,7 +559,6 @@ public:
         }
     }
 
-    // Append a string
     void append(const char* s) {
         size_t add_len = strlen(s);
         ensure_capacity(_size + add_len + 1);
@@ -393,9 +602,7 @@ private:
     size_t _size;
     size_t _capacity;
 
-    // Allocate a page for the buffer
     void allocate_page(size_t min_capacity) {
-        // Free the old page if needed
         if (_buf && _page_idx >= 0) VMManager::instance().swap_out(_page_idx);
         size_t alloc_size = std::max(min_capacity, (size_t)VMManager::instance().page_size);
         VMManager::instance().alloc_page(&_page_idx, true);
@@ -403,21 +610,17 @@ private:
         _capacity = alloc_size;
     }
 
-    // Ensure the buffer has enough capacity
     void ensure_capacity(size_t min_capacity) {
         if (min_capacity > _capacity) {
-            // Need to expand the buffer!
             char* old_buf = _buf;
             int old_page_idx = _page_idx;
             size_t old_size = _size;
 
-            allocate_page(min_capacity * 2); // double buffer for growth
+            allocate_page(min_capacity * 2);
 
-            // Copy old content
             if (old_buf) {
-                memcpy(_buf, old_buf, old_size + 1); // +1 for '\0'
+                memcpy(_buf, old_buf, old_size + 1);
                 _size = old_size;
-                // Swap out old page
                 VMManager::instance().swap_out(old_page_idx);
             }
         }

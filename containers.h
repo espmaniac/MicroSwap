@@ -2,21 +2,26 @@
 
 /**
  * @file containers.h
- * @brief Virtual memory containers with paging & swapping for Arduino.
+ * @brief Virtual memory manager, STL-like containers, and VMPtr smart pointer with paging & swapping for Arduino.
  *
  * @details
- * This header implements a lightweight virtual memory manager and STL-like container
- * wrappers (VMVector, VMArray, VMString) that transparently page data in/out of a
- * swap file stored on an Arduino-compatible filesystem (e.g. SPIFFS / LittleFS).
+ * This header provides:
+ *  - VMManager: a lightweight virtual memory manager that pages data to/from a swap file on Arduino-compatible filesystems
+ *    (e.g., SPIFFS / LittleFS) using a fixed number of RAM-backed pages.
+ *  - STL-like containers (VMVector, VMArray, VMString) that transparently use the virtual memory pages as backing storage.
+ *  - VMPtr<T>: a smart pointer to objects stored inside a virtual memory page with pointer arithmetic, indexing, and
+ *    transparent swap-in on access. Its internal constructor (page, offset) is protected to prevent unsafe user creation;
+ *    users should rely on default construction and let pages be allocated lazily on first access.
  *
  * Core features:
  *  - Fixed number of pages (compile-time constants VM_PAGE_SIZE / VM_PAGE_COUNT).
  *  - On-demand page allocation with optional zeroing and reuse of previous swap data.
  *  - Dirty page tracking & explicit flushing.
  *  - Separation of read vs write access: get_read_ptr() does not mark dirty,
- *    while get_write_ptr() (and legacy get_ptr()) does.
- *  - Containers (vector / array / string) using pages as backing storage
- *    with iterators (including reverse iterators) and bounds-checked at().
+ *    while get_write_ptr() (and legacy get_ptr()) marks dirty.
+ *  - VMPtr<T> performs lazy allocation and swap-in, supports pointer arithmetic and indexing, and keeps write intent explicit.
+ *  - Containers (vector / array / string) using pages as backing storage with iterators (including reverse iterators)
+ *    and bounds-checked at().
  *
  * Limitations:
  *  - VMArray does not call constructors/destructors for non-trivial types.
@@ -25,6 +30,13 @@
  *
  * Usage scenario:
  *  - Helps when RAM is scarce and some data can reside in a swap file when inactive.
+ *
+ * Safety:
+ *  - VMPtr's (page, offset) constructor is protected to avoid unsafe manual pointer creation by end users.
+ *  - VMManager internals are private; only friend types (VMPtr/containers) can touch low-level paging.
+ *
+ * Thread safety:
+ *  - Not thread-safe.
  *
  * @note Generated with assistance of GitHub Copilot.
  * @note Designed for Arduino environments supporting FS abstractions.
@@ -60,6 +72,12 @@ struct VMPage {
     uint64_t last_access;///< Monotonic access counter (for potential eviction heuristics).
 };
 
+// Forward declarations for friend declarations
+template<typename T> class VMPtr;
+template<typename T> class VMVector;
+template<typename T, size_t N> class VMArray;
+class VMString;
+
 /**
  * @class VMManager
  * @brief Singleton managing a pool of fixed-size pages with swap file backing.
@@ -93,17 +111,13 @@ public:
         return inst;
     }
 
-    VMPage pages[VM_PAGE_COUNT]; ///< Page table.
-    File swap_file;              ///< Opened swap file handle.
-    fs::FS* fs = nullptr;        ///< Filesystem pointer.
-    size_t page_size = VM_PAGE_SIZE; ///< Current page size (constant).
-    size_t page_count = VM_PAGE_COUNT; ///< Number of pages (constant).
-
     /**
      * @brief Initialize the manager and create a fresh swap file.
      * @param filesystem Filesystem to use (e.g. SPIFFS / LittleFS).
      * @param swap_path Path to swap file.
      * @return True on success.
+     *
+     * @note This is part of the minimal public API that user code may call.
      */
     bool begin(fs::FS& filesystem, const char* swap_path) {
         if (started) end();
@@ -138,7 +152,86 @@ public:
     }
 
     /**
-     * @brief Allocate a page with extended options.
+     * @brief Flush all allocated pages (force write) and keep allocations.
+     *
+     * @note This is part of the minimal public API that user code may call.
+     */
+    void flush_all() {
+        for (size_t i = 0; i < page_count; ++i)
+            if (pages[i].allocated)
+                swap_out((int)i, true);
+    }
+
+    /**
+     * @brief Shutdown manager, flushing and freeing all pages.
+     *
+     * @note This is part of the minimal public API that user code may call.
+     */
+    void end() {
+        if (!started) return;
+        for (size_t i = 0; i < page_count; i++) {
+            if (pages[i].allocated) {
+                swap_out((int)i, false);
+                free_page((int)i);
+            } else if (pages[i].ram_addr) {
+                free(pages[i].ram_addr);
+                pages[i].ram_addr = nullptr;
+            }
+        }
+        if (swap_file) {
+            swap_file.flush();
+            swap_file.close();
+        }
+        fs = nullptr;
+        started = false;
+    }
+
+    /**
+     * @brief Get current page size (bytes).
+     * @return Page size.
+     *
+     * @note Minimal public accessor; safe for user code.
+     */
+    size_t get_page_size() const { return page_size; }
+
+    /**
+     * @brief Get number of pages.
+     * @return Page count.
+     *
+     * @note Minimal public accessor; safe for user code.
+     */
+    size_t get_page_count() const { return page_count; }
+
+private:
+    VMManager() : started(false), access_tick(0) {
+        default_alloc_options.zero_on_alloc = true;
+        default_alloc_options.reuse_swap_data = false;
+        default_alloc_options.can_free_ram   = true;
+    }
+    VMManager(const VMManager&) = delete;
+    VMManager& operator=(const VMManager&) = delete;
+
+    // Grant privileged access to VM friends only.
+    template<typename T> friend class ::VMPtr;
+    template<typename T> friend class ::VMVector;
+    template<typename T, size_t N> friend class ::VMArray;
+    friend class ::VMString;
+
+    // -------------------- Private state (hidden from end users) --------------------
+    VMPage pages[VM_PAGE_COUNT]; ///< Page table.
+    File swap_file;              ///< Opened swap file handle.
+    fs::FS* fs = nullptr;        ///< Filesystem pointer.
+    size_t page_size = VM_PAGE_SIZE; ///< Current page size (constant).
+    size_t page_count = VM_PAGE_COUNT; ///< Number of pages (constant).
+
+    bool started;                    ///< True if manager initialized.
+    uint64_t access_tick;            ///< Global access counter.
+    AllocOptions default_alloc_options; ///< Default allocation options.
+
+    // -------------------- Private helpers (used by friends) --------------------
+
+    /**
+     * @brief Allocate a page with extended options (first free slot).
      * @param opts Allocation options.
      * @param out_idx Optional output page index.
      * @return Pointer to page RAM buffer or nullptr on failure.
@@ -174,6 +267,48 @@ public:
             }
         }
         return nullptr;
+    }
+
+    /**
+     * @brief Allocate the specific page index (no scan), if it is free.
+     * @param idx Page index to allocate.
+     * @param opts Allocation options.
+     * @return Pointer to RAM buffer or nullptr on failure.
+     *
+     * @note Used by VMPtr to auto-allocate on-demand at a specific index.
+     */
+    uint8_t* alloc_page_at(int idx, const AllocOptions& opts) {
+        if (!valid_index(idx)) return nullptr;
+        VMPage& pg = pages[idx];
+        if (pg.allocated) {
+            // Already allocated, ensure in RAM (swap-in) and return pointer.
+            if (!pg.in_ram || !pg.ram_addr) {
+                if (!swap_in(idx)) return nullptr;
+            }
+            return pg.ram_addr;
+        }
+        pg.ram_addr = (uint8_t*)malloc(page_size);
+        if (!pg.ram_addr) return nullptr;
+        pg.allocated    = true;
+        pg.in_ram       = true;
+        pg.can_free_ram = opts.can_free_ram;
+        pg.last_access  = ++access_tick;
+
+        if (opts.reuse_swap_data) {
+            swap_file.seek(pg.swap_offset);
+            swap_file.read(pg.ram_addr, page_size);
+            pg.dirty = false;
+            pg.zero_filled = false;
+        } else {
+            if (opts.zero_on_alloc) {
+                memset(pg.ram_addr, 0, page_size);
+                pg.zero_filled = true;
+            } else {
+                pg.zero_filled = false;
+            }
+            pg.dirty = true;
+        }
+        return pg.ram_addr;
     }
 
     /**
@@ -312,15 +447,6 @@ public:
     bool flush_page(int idx) { return swap_out(idx, true); }
 
     /**
-     * @brief Flush all allocated pages.
-     */
-    void flush_all() {
-        for (size_t i = 0; i < page_count; ++i)
-            if (pages[i].allocated)
-                swap_out((int)i, true);
-    }
-
-    /**
      * @brief Free a page and optionally wipe its swap area.
      * @param idx Page index.
      * @param wipe If true, overwrite swap content with zeros.
@@ -355,28 +481,6 @@ public:
     }
 
     /**
-     * @brief Shutdown manager, flushing and freeing all pages.
-     */
-    void end() {
-        if (!started) return;
-        for (size_t i = 0; i < page_count; i++) {
-            if (pages[i].allocated) {
-                swap_out((int)i, false);
-                free_page((int)i);
-            } else if (pages[i].ram_addr) {
-                free(pages[i].ram_addr);
-                pages[i].ram_addr = nullptr;
-            }
-        }
-        if (swap_file) {
-            swap_file.flush();
-            swap_file.close();
-        }
-        fs = nullptr;
-        started = false;
-    }
-
-    /**
      * @brief Set default allocation options for future alloc_page() calls.
      * @param opts Options.
      */
@@ -401,19 +505,6 @@ public:
         return idx >= 0 && idx < (int)page_count;
     }
 
-private:
-    VMManager() : started(false), access_tick(0) {
-        default_alloc_options.zero_on_alloc = true;
-        default_alloc_options.reuse_swap_data = false;
-        default_alloc_options.can_free_ram   = true;
-    }
-    VMManager(const VMManager&) = delete;
-    VMManager& operator=(const VMManager&) = delete;
-
-    bool started;                    ///< True if manager initialized.
-    uint64_t access_tick;            ///< Global access counter.
-    AllocOptions default_alloc_options; ///< Default allocation options.
-
     /**
      * @brief Internal pointer acquisition.
      * @param page_idx Page index.
@@ -433,6 +524,298 @@ private:
         if (mark_dirty_flag) page.dirty = true;
         return page.ram_addr + offset;
     }
+};
+
+/**
+ * @class VMPtr
+ * @brief Smart pointer for objects stored in virtual memory with pointer arithmetic and indexing.
+ *
+ * @details
+ * VMPtr represents a logical pointer to an object stored in a virtual memory page.
+ * It stores the page index and offset inside the page. On dereferencing or member access,
+ * it transparently ensures the corresponding memory page is swapped in (loaded in RAM)
+ * and returns a pointer or reference to the object of type T.
+ * 
+ * Supports pointer arithmetic (operator+, operator-, ++, --, etc.), indexing (operator[]), and comparisons.
+ * 
+ * Additional behavior:
+ *  - Pages are auto-allocated on-demand. If the pointer has no page yet (page_idx == -1) or points to a
+ *    not-yet-allocated page, the VMManager will allocate that page automatically on first access.
+ *
+ * @tparam T Object type pointed to.
+ */
+template<typename T>
+class VMPtr {
+public:
+    /**
+     * @brief Default constructor (null pointer).
+     */
+    VMPtr() : page_idx_(-1), offset_(0) {}
+
+    /**
+     * @brief Check if pointer references a valid virtual address range (index in range and offset fits page).
+     * @return True if virtual position is well-formed.
+     *
+     * @note Allocation state is not required for validity. Pages may be lazily allocated later.
+     */
+    bool valid() const {
+        const auto& mgr = VMManager::instance();
+        return mgr.valid_index(page_idx_)
+            && offset_ + sizeof(T) <= mgr.get_page_size();
+    }
+
+    /**
+     * @brief Dereference pointer, ensures the page is loaded, returns reference to object.
+     * @return Reference to object.
+     * @throws std::runtime_error if invalid.
+     */
+    T& operator*() {
+        ensure_loaded();
+        return *ptr();
+    }
+    /**
+     * @brief Dereference pointer, const version.
+     * @return Const reference to object.
+     * @throws std::runtime_error if invalid.
+     */
+    const T& operator*() const {
+        ensure_loaded();
+        return *ptr();
+    }
+
+    /**
+     * @brief Member access operator.
+     * @return Pointer to object.
+     * @throws std::runtime_error if invalid.
+     */
+    T* operator->() {
+        ensure_loaded();
+        return ptr();
+    }
+    /**
+     * @brief Member access operator, const version.
+     * @return Const pointer to object.
+     * @throws std::runtime_error if invalid.
+     */
+    const T* operator->() const {
+        ensure_loaded();
+        return ptr();
+    }
+
+    /**
+     * @brief Get raw pointer to object in RAM (after swapping in).
+     * @return Pointer to object.
+     */
+    T* get() {
+        ensure_loaded();
+        return ptr();
+    }
+    /**
+     * @brief Get const raw pointer to object in RAM (after swapping in).
+     * @return Const pointer to object.
+     */
+    const T* get() const {
+        ensure_loaded();
+        return ptr();
+    }
+
+    /**
+     * @brief Get page index.
+     * @return Page index.
+     */
+    int page_index() const { return page_idx_; }
+
+    /**
+     * @brief Get offset inside the page.
+     * @return Offset in bytes.
+     */
+    size_t page_offset() const { return offset_; }
+
+    /**
+     * @brief Equality comparison.
+     * @param other Another VMPtr.
+     * @return True if points to same page and offset.
+     */
+    bool operator==(const VMPtr& other) const {
+        return page_idx_ == other.page_idx_ && offset_ == other.offset_;
+    }
+
+    /**
+     * @brief Inequality comparison.
+     * @param other Another VMPtr.
+     * @return True if not equal.
+     */
+    bool operator!=(const VMPtr& other) const {
+        return !(*this == other);
+    }
+
+    /**
+     * @brief Less-than comparison for ordering.
+     * @param other Another VMPtr.
+     * @return True if this < other (by virtual address).
+     */
+    bool operator<(const VMPtr& other) const {
+        if (page_idx_ != other.page_idx_)
+            return page_idx_ < other.page_idx_;
+        return offset_ < other.offset_;
+    }
+    bool operator>(const VMPtr& other) const { return other < *this; }
+    bool operator<=(const VMPtr& other) const { return !(*this > other); }
+    bool operator>=(const VMPtr& other) const { return !(*this < other); }
+
+    /**
+     * @brief Pointer arithmetic: addition (move forward n elements).
+     * @param n Number of elements.
+     * @return New VMPtr<T> advanced by n elements.
+     */
+    VMPtr operator+(ptrdiff_t n) const {
+        if (!valid()) throw std::runtime_error("VMPtr: arithmetic on invalid pointer");
+        const auto& mgr = VMManager::instance();
+        size_t element_offset = offset_ + n * sizeof(T);
+        int new_page = page_idx_;
+        size_t page_size = mgr.get_page_size();
+        // Move forward (or backward) across pages if needed
+        if (element_offset >= page_size) {
+            new_page += static_cast<int>(element_offset / page_size);
+            element_offset = element_offset % page_size;
+        } else if ((ptrdiff_t)element_offset < 0) {
+            // Move backward across pages
+            ptrdiff_t total_offset = static_cast<ptrdiff_t>(offset_) + n * static_cast<ptrdiff_t>(sizeof(T));
+            while (total_offset < 0) {
+                new_page -= 1;
+                total_offset += page_size;
+            }
+            element_offset = static_cast<size_t>(total_offset);
+        }
+        return VMPtr(new_page, element_offset);
+    }
+
+    /**
+     * @brief Pointer arithmetic: subtraction (move backward n elements).
+     * @param n Number of elements.
+     * @return New VMPtr<T> moved backward by n elements.
+     */
+    VMPtr operator-(ptrdiff_t n) const {
+        return *this + (-n);
+    }
+
+    /**
+     * @brief Pointer difference: number of elements between this and other.
+     * @param other Another VMPtr<T> (must refer to same virtual "array").
+     * @return Difference in elements.
+     */
+    ptrdiff_t operator-(const VMPtr& other) const {
+        const auto& mgr = VMManager::instance();
+        ptrdiff_t page_delta = static_cast<ptrdiff_t>(page_idx_) - static_cast<ptrdiff_t>(other.page_idx_);
+        ptrdiff_t byte_delta = static_cast<ptrdiff_t>(offset_) - static_cast<ptrdiff_t>(other.offset_);
+        return (page_delta * static_cast<ptrdiff_t>(mgr.get_page_size()) + byte_delta) / static_cast<ptrdiff_t>(sizeof(T));
+    }
+
+    /**
+     * @brief Pre-increment: move to next element.
+     * @return *this after increment.
+     */
+    VMPtr& operator++() { *this = *this + 1; return *this; }
+    /**
+     * @brief Post-increment: move to next element.
+     * @return Copy before increment.
+     */
+    VMPtr operator++(int) { VMPtr tmp = *this; ++(*this); return tmp; }
+    /**
+     * @brief Pre-decrement: move to previous element.
+     * @return *this after decrement.
+     */
+    VMPtr& operator--() { *this = *this - 1; return *this; }
+    /**
+     * @brief Post-decrement: move to previous element.
+     * @return Copy before decrement.
+     */
+    VMPtr operator--(int) { VMPtr tmp = *this; --(*this); return tmp; }
+    /**
+     * @brief Addition assignment.
+     * @param n Number of elements to move.
+     * @return *this after addition.
+     */
+    VMPtr& operator+=(ptrdiff_t n) { *this = *this + n; return *this; }
+    /**
+     * @brief Subtraction assignment.
+     * @param n Number of elements to move back.
+     * @return *this after subtraction.
+     */
+    VMPtr& operator-=(ptrdiff_t n) { *this = *this - n; return *this; }
+
+    /**
+     * @brief Indexing operator: get reference to element at offset n.
+     * @param n Index offset (can be negative).
+     * @return Reference to element at offset.
+     */
+    T& operator[](ptrdiff_t n) {
+        return *(*this + n);
+    }
+    /**
+     * @brief Indexing operator: get const reference to element at offset n.
+     * @param n Index offset (can be negative).
+     * @return Const reference to element at offset.
+     */
+    const T& operator[](ptrdiff_t n) const {
+        return *(*this + n);
+    }
+
+protected:
+    /**
+     * @brief Construct from page index and offset (protected).
+     * @param page Page index in VMManager.
+     * @param offset Offset in bytes inside page.
+     *
+     * @note Protected to prevent unsafe direct use by end users.
+     *       Intended for internal operations and arithmetic within VMPtr only.
+     */
+    VMPtr(int page, size_t offset) : page_idx_(page), offset_(offset) {}
+
+private:
+    /**
+     * @brief Ensure the referenced page is loaded into RAM, allocating it if needed.
+     *
+     * @throws std::runtime_error If virtual position is out of range or allocation fails.
+     */
+    void ensure_loaded() const {
+        auto& mgr = VMManager::instance();
+        // Resolve oversized offset into page/offset form if needed
+        if (page_idx_ == -1) {
+            // First-time use: allocate a fresh page.
+            int new_idx = -1;
+            if (!mgr.alloc_page(&new_idx, true))
+                throw std::runtime_error("VMPtr: failed to allocate page");
+            page_idx_ = new_idx;
+        } else {
+            if (!mgr.valid_index(page_idx_))
+                throw std::runtime_error("VMPtr: page index out of range");
+        }
+
+        // If target page exists but not allocated yet, allocate it in-place.
+        if (!mgr.pages[page_idx_].allocated) {
+            if (!mgr.alloc_page_at(page_idx_, mgr.default_alloc_options))
+                throw std::runtime_error("VMPtr: failed to allocate target page");
+        }
+
+        // Ensure offset fits within the page for object T.
+        if (offset_ + sizeof(T) > mgr.get_page_size())
+            throw std::runtime_error("VMPtr: object straddles page boundary");
+
+        // Ensure page is resident.
+        mgr.swap_in(page_idx_);
+    }
+
+    /**
+     * @brief Get pointer to the object in RAM.
+     * @return Pointer to object.
+     */
+    T* ptr() const {
+        return reinterpret_cast<T*>(VMManager::instance().get_write_ptr(page_idx_, offset_));
+    }
+
+    mutable int page_idx_;   ///< Index of page in VMManager (auto-allocated on demand).
+    size_t offset_;          ///< Offset inside the page (in bytes).
 };
 
 // -----------------------------------------------------------------------------
@@ -1111,7 +1494,9 @@ public:
     explicit VMString(size_t initial_capacity = 64)
         : _page_idx(-1), _buf(nullptr), _size(0), _capacity(0) {
         allocate_initial_page(initial_capacity);
-        _buf[0] = '\0';
+        // Always refresh pointer through write path to ensure residency.
+        char* b = write_buf();
+        b[0] = '\0';
     }
 
     /// Construct from C-string.
@@ -1141,7 +1526,7 @@ public:
     /// Move assignment.
     VMString& operator=(VMString&& other) noexcept {
         if (this != &other) {
-            if (_buf) VMManager::instance().free_page(_page_idx);
+            if (_page_idx >= 0) VMManager::instance().free_page(_page_idx);
             _page_idx = other._page_idx;
             _buf      = other._buf;
             _size     = other._size;
@@ -1156,7 +1541,7 @@ public:
 
     /// Destructor frees page.
     ~VMString() {
-        if (_buf && _page_idx >= 0) {
+        if (_page_idx >= 0) {
             VMManager::instance().free_page(_page_idx);
             _buf = nullptr;
             _page_idx = -1;
@@ -1186,7 +1571,7 @@ public:
      */
     reference at(size_type pos) {
         if (pos >= _size) throw std::out_of_range("VMString::at");
-        return _buf[pos];
+        return write_buf()[pos];
     }
     /**
      * @brief Bounds-checked const access.
@@ -1195,7 +1580,7 @@ public:
      */
     const_reference at(size_type pos) const {
         if (pos >= _size) throw std::out_of_range("VMString::at const");
-        return _buf[pos];
+        return read_buf()[pos];
     }
     /**
      * @brief Unchecked mutable access.
@@ -1203,7 +1588,7 @@ public:
      */
     reference operator[](size_type idx) {
         if (idx >= _size) throw std::out_of_range("VMString::operator[]");
-        return _buf[idx];
+        return write_buf()[idx];
     }
     /**
      * @brief Unchecked const access.
@@ -1211,34 +1596,37 @@ public:
      */
     const_reference operator[](size_type idx) const {
         if (idx >= _size) throw std::out_of_range("VMString::operator[] const");
-        return _buf[idx];
+        return read_buf()[idx];
     }
     /// Get first character.
     reference front() {
         if (empty()) throw std::out_of_range("VMString::front");
-        return _buf[0];
+        return write_buf()[0];
     }
     /// Get first character (const).
     const_reference front() const {
         if (empty()) throw std::out_of_range("VMString::front const");
-        return _buf[0];
+        return read_buf()[0];
     }
     /// Get last character.
     reference back() {
         if (empty()) throw std::out_of_range("VMString::back");
-        return _buf[_size - 1];
+        return write_buf()[_size - 1];
     }
     /// Get last character (const).
     const_reference back() const {
         if (empty()) throw std::out_of_range("VMString::back const");
-        return _buf[_size - 1];
+        return read_buf()[_size - 1];
     }
 
     /**
      * @brief Get C-string pointer (null-terminated).
      * @return Pointer (never null).
      */
-    const char* c_str() const { return _buf ? _buf : ""; }
+    const char* c_str() const {
+        // Always refresh pointer via read access. If page not present (moved-from), return empty literal.
+        return (_page_idx >= 0) ? read_buf() : "";
+    }
 
     // Capacity
     bool empty() const { return _size == 0; }
@@ -1249,7 +1637,7 @@ public:
      * @brief Maximum storable characters (excluding null terminator).
      * @return Limit (page_size - 1).
      */
-    size_type max_size() const { return VMManager::instance().page_size - 1; }
+    size_type max_size() const { return VMManager::instance().get_page_size() - 1; }
 
     /**
      * @brief Ensure capacity >= new_cap.
@@ -1272,10 +1660,11 @@ public:
     void resize(size_type new_size, char ch = '\0') {
         if (new_size > max_size()) throw std::length_error("VMString::resize exceeds one page");
         ensure_capacity(new_size + 1);
+        char* buf = write_buf();
         if (new_size > _size)
-            memset(_buf + _size, ch, new_size - _size);
+            memset(buf + _size, ch, new_size - _size);
         _size = new_size;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
     }
 
     // Assign
@@ -1291,9 +1680,10 @@ public:
      */
     void assign(const char* s, size_type count) {
         ensure_capacity(count + 1);
-        if (count) memcpy(_buf, s, count);
+        char* buf = write_buf();
+        if (count) memcpy(buf, s, count);
         _size = count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
     }
     /**
      * @brief Assign repeated character.
@@ -1302,9 +1692,10 @@ public:
      */
     void assign(size_type count, char ch) {
         ensure_capacity(count + 1);
-        memset(_buf, ch, count);
+        char* buf = write_buf();
+        memset(buf, ch, count);
         _size = count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
     }
     /**
      * @brief Assign substring of another VMString.
@@ -1322,17 +1713,19 @@ public:
     VMString& append(const char* s) { return append(s, strlen(s)); }
     VMString& append(const char* s, size_type count) {
         ensure_capacity(_size + count + 1);
-        if (count) memcpy(_buf + _size, s, count);
+        char* buf = write_buf();
+        if (count) memcpy(buf + _size, s, count);
         _size += count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
         return *this;
     }
     VMString& append(const VMString& other) { return append(other.c_str(), other._size); }
     VMString& append(size_type count, char ch) {
         ensure_capacity(_size + count + 1);
-        memset(_buf + _size, ch, count);
+        char* buf = write_buf();
+        memset(buf + _size, ch, count);
         _size += count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
         return *this;
     }
 
@@ -1342,16 +1735,18 @@ public:
      */
     void push_back(char c) {
         ensure_capacity(_size + 2);
-        _buf[_size++] = c;
-        _buf[_size] = '\0';
+        char* buf = write_buf();
+        buf[_size++] = c;
+        buf[_size] = '\0';
     }
     /**
      * @brief Remove last character.
      */
     void pop_back() {
         if (empty()) throw std::out_of_range("VMString::pop_back");
+        char* buf = write_buf();
         _size--;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
     }
 
     VMString& operator+=(const char* s) { return append(s); }
@@ -1363,19 +1758,21 @@ public:
     VMString& insert(size_type pos, const char* s, size_type count) {
         if (pos > _size) throw std::out_of_range("VMString::insert");
         ensure_capacity(_size + count + 1);
-        memmove(_buf + pos + count, _buf + pos, _size - pos);
-        if (count) memcpy(_buf + pos, s, count);
+        char* buf = write_buf();
+        memmove(buf + pos + count, buf + pos, _size - pos);
+        if (count) memcpy(buf + pos, s, count);
         _size += count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
         return *this;
     }
     VMString& insert(size_type pos, size_type count, char ch) {
         if (pos > _size) throw std::out_of_range("VMString::insert");
         ensure_capacity(_size + count + 1);
-        memmove(_buf + pos + count, _buf + pos, _size - pos);
-        memset(_buf + pos, ch, count);
+        char* buf = write_buf();
+        memmove(buf + pos + count, buf + pos, _size - pos);
+        memset(buf + pos, ch, count);
         _size += count;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
         return *this;
     }
     VMString& insert(size_type pos, const VMString& other) {
@@ -1392,9 +1789,10 @@ public:
     VMString& erase(size_type pos = 0, size_type count = npos) {
         if (pos > _size) throw std::out_of_range("VMString::erase");
         size_type rcount = std::min(count, _size - pos);
-        memmove(_buf + pos, _buf + pos + rcount, _size - pos - rcount);
+        char* buf = write_buf();
+        memmove(buf + pos, buf + pos + rcount, _size - pos - rcount);
         _size -= rcount;
-        _buf[_size] = '\0';
+        buf[_size] = '\0';
         return *this;
     }
 
@@ -1402,13 +1800,16 @@ public:
     VMString& replace(size_type pos, size_type count, const char* s, size_type s_count) {
         if (pos > _size) throw std::out_of_range("VMString::replace");
         size_type rcount = std::min(count, _size - pos);
+        char* buf = write_buf();
         if (s_count != rcount) {
             if (s_count > rcount) ensure_capacity(_size + (s_count - rcount) + 1);
-            memmove(_buf + pos + s_count, _buf + pos + rcount, _size - (pos + rcount));
+            // Refresh write buffer again in case capacity changed (page may be reallocated)
+            buf = write_buf();
+            memmove(buf + pos + s_count, buf + pos + rcount, _size - (pos + rcount));
             _size = _size - rcount + s_count;
         }
-        if (s_count) memcpy(_buf + pos, s, s_count);
-        _buf[_size] = '\0';
+        if (s_count) memcpy(buf + pos, s, s_count);
+        buf[_size] = '\0';
         return *this;
     }
     VMString& replace(size_type pos, size_type count, const char* s) {
@@ -1442,7 +1843,8 @@ public:
     size_type copy(char* dest, size_type count, size_type pos = 0) const {
         if (pos > _size) throw std::out_of_range("VMString::copy");
         size_type rcount = std::min(count, _size - pos);
-        if (rcount) memcpy(dest, _buf + pos, rcount);
+        const char* buf = read_buf();
+        if (rcount) memcpy(dest, buf + pos, rcount);
         return rcount;
     }
 
@@ -1462,15 +1864,17 @@ public:
     size_type find(const char* s, size_type pos, size_type count) const {
         if (count == 0) return pos <= _size ? pos : npos;
         if (count > _size) return npos;
+        const char* buf = read_buf();
         for (size_type i = pos; i + count <= _size; ++i)
-            if (memcmp(_buf + i, s, count) == 0) return i;
+            if (memcmp(buf + i, s, count) == 0) return i;
         return npos;
     }
     size_type find(const char* s, size_type pos = 0) const { return find(s, pos, strlen(s)); }
     size_type find(const VMString& other, size_type pos = 0) const { return find(other.c_str(), pos, other._size); }
     size_type find(char ch, size_type pos = 0) const {
+        const char* buf = read_buf();
         for (size_type i = pos; i < _size; ++i)
-            if (_buf[i] == ch) return i;
+            if (buf[i] == ch) return i;
         return npos;
     }
 
@@ -1478,9 +1882,10 @@ public:
     size_type rfind(const char* s, size_type pos, size_type count) const {
         if (count == 0) return std::min(pos, _size);
         if (count > _size) return npos;
+        const char* buf = read_buf();
         size_type start = std::min(pos, _size - count);
         for (size_type i = start + 1; i-- > 0;) {
-            if (memcmp(_buf + i, s, count) == 0) return i;
+            if (memcmp(buf + i, s, count) == 0) return i;
             if (i == 0) break;
         }
         return npos;
@@ -1492,16 +1897,18 @@ public:
         return rfind(other.c_str(), pos == npos ? _size : pos, other._size);
     }
     size_type rfind(char ch, size_type pos = npos) const {
+        const char* buf = read_buf();
         size_type i = std::min(pos == npos ? _size : pos, _size);
         while (i-- > 0)
-            if (_buf[i] == ch) return i;
+            if (buf[i] == ch) return i;
         return npos;
     }
 
     // Character class finds
     size_type find_first_of(const char* s, size_type pos = 0) const {
+        const char* buf = read_buf();
         for (size_type i = pos; i < _size; ++i)
-            if (strchr(s, _buf[i])) return i;
+            if (strchr(s, buf[i])) return i;
         return npos;
     }
     size_type find_first_of(const VMString& other, size_type pos = 0) const {
@@ -1512,9 +1919,10 @@ public:
     }
 
     size_type find_last_of(const char* s, size_type pos = npos) const {
+        const char* buf = read_buf();
         size_type i = std::min(pos == npos ? _size : pos, _size);
         while (i-- > 0)
-            if (strchr(s, _buf[i])) return i;
+            if (strchr(s, buf[i])) return i;
         return npos;
     }
     size_type find_last_of(const VMString& other, size_type pos = npos) const {
@@ -1525,32 +1933,36 @@ public:
     }
 
     size_type find_first_not_of(const char* s, size_type pos = 0) const {
+        const char* buf = read_buf();
         for (size_type i = pos; i < _size; ++i)
-            if (!strchr(s, _buf[i])) return i;
+            if (!strchr(s, buf[i])) return i;
         return npos;
     }
     size_type find_first_not_of(const VMString& other, size_type pos = 0) const {
         return find_first_not_of(other.c_str(), pos);
     }
     size_type find_first_not_of(char ch, size_type pos = 0) const {
+        const char* buf = read_buf();
         for (size_type i = pos; i < _size; ++i)
-            if (_buf[i] != ch) return i;
+            if (buf[i] != ch) return i;
         return npos;
     }
 
     size_type find_last_not_of(const char* s, size_type pos = npos) const {
+        const char* buf = read_buf();
         size_type i = std::min(pos == npos ? _size : pos, _size);
         while (i-- > 0)
-            if (!strchr(s, _buf[i])) return i;
+            if (!strchr(s, buf[i])) return i;
         return npos;
     }
     size_type find_last_not_of(const VMString& other, size_type pos = npos) const {
         return find_last_not_of(other.c_str(), pos);
     }
     size_type find_last_not_of(char ch, size_type pos = npos) const {
+        const char* buf = read_buf();
         size_type i = std::min(pos == npos ? _size : pos, _size);
         while (i-- > 0)
-            if (_buf[i] != ch) return i;
+            if (buf[i] != ch) return i;
         return npos;
     }
 
@@ -1561,7 +1973,9 @@ public:
      * @return Negative, 0, or positive like strcmp.
      */
     int compare(const VMString& other) const {
-        int r = std::memcmp(_buf, other._buf, std::min(_size, other._size));
+        const char* a = read_buf();
+        const char* b = other.c_str();
+        int r = std::memcmp(a, b, std::min(_size, other._size));
         if (r != 0) return r;
         if (_size == other._size) return 0;
         return _size < other._size ? -1 : 1;
@@ -1572,14 +1986,15 @@ public:
      * @return Comparison result.
      */
     int compare(const char* s) const {
+        const char* a = read_buf();
         size_type slen = std::strlen(s);
-        int r = std::memcmp(_buf, s, std::min(_size, slen));
+        int r = std::memcmp(a, s, std::min(_size, slen));
         if (r != 0) return r;
         if (_size == slen) return 0;
         return _size < slen ? -1 : 1;
     }
 
-    bool operator==(const VMString& other) const { return _size == other._size && std::memcmp(_buf, other._buf, _size) == 0; }
+    bool operator==(const VMString& other) const { return _size == other._size && std::memcmp(read_buf(), other.c_str(), _size) == 0; }
     bool operator!=(const VMString& other) const { return !(*this == other); }
     bool operator<(const VMString& other)  const { return compare(other) < 0; }
     bool operator>(const VMString& other)  const { return compare(other) > 0; }
@@ -1587,52 +2002,63 @@ public:
     bool operator>=(const VMString& other) const { return compare(other) >= 0; }
 
     /**
-     * @brief Clear content (size = 0) and swap page out.
+     * @brief Clear content (size = 0) and swap page out, leaving no dangling _buf.
+     *
+     * @details After swap_out(), if the page is allowed to free RAM, any cached pointer becomes invalid.
+     *          We explicitly set _buf to nullptr to avoid a dangling pointer.
      */
     void clear() {
-        if (_buf) {
-            _buf[0] = '\0';
+        if (_page_idx >= 0) {
+            char* buf = write_buf();
+            buf[0] = '\0';
             _size = 0;
             VMManager::instance().swap_out(_page_idx);
+            _buf = nullptr; // avoid stale pointer after potential RAM free
+        } else {
+            _size = 0;
         }
     }
 
 private:
-    int _page_idx;     ///< Page index for string storage.
-    char* _buf;        ///< Character buffer.
-    size_type _size;   ///< Current string length.
-    size_type _capacity; ///< Usable character capacity (excl. null).
+    int _page_idx;              ///< Page index for string storage.
+    mutable char* _buf;         ///< Cached character buffer; refreshed on each access to avoid dangling.
+    size_type _size;            ///< Current string length.
+    size_type _capacity;        ///< Usable character capacity (excl. null).
 
     /**
-     * @brief Allocate initial page and setup buffer pointer.
-     * @param min_capacity Required capacity hint.
+     * @brief Allocate initial page and setup internal state.
+     * @param min_capacity Required capacity hint (within single page).
      */
     void allocate_initial_page(size_type /*min_capacity*/) {
         int pidx;
         VMManager::instance().alloc_page(&pidx, true);
         _page_idx = pidx;
-        _buf = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(_page_idx, 0));
-        _capacity = VMManager::instance().page_size - 1;
+        // Initialize capacity; pointer will be obtained lazily on access.
+        _capacity = VMManager::instance().get_page_size() - 1;
+        _buf = nullptr; // will be acquired via write_buf/read_buf
     }
 
     /**
-     * @brief Reallocate to a fresh page (still single page).
+     * @brief Reallocate to a fresh page (still single page) and copy existing data.
      * @param min_capacity Required capacity.
      */
     void reallocate_page(size_type min_capacity) {
         if (min_capacity > max_size()) throw std::length_error("VMString::reallocate_page exceeds single page limit");
+        // Acquire read pointer to existing data before switching pages
+        const char* old_buf = (_page_idx >= 0) ? read_buf() : nullptr;
+
         int new_page_idx;
         VMManager::instance().alloc_page(&new_page_idx, true);
         char* new_buf = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(new_page_idx, 0));
-        size_type new_capacity = VMManager::instance().page_size - 1;
+        size_type new_capacity = VMManager::instance().get_page_size() - 1;
         size_type copy_len = std::min(_size, new_capacity);
-        if (copy_len) memcpy(new_buf, _buf, copy_len);
+        if (copy_len && old_buf) memcpy(new_buf, old_buf, copy_len);
         _size = copy_len;
         new_buf[_size] = '\0';
         if (_page_idx >= 0)
             VMManager::instance().free_page(_page_idx);
         _page_idx = new_page_idx;
-        _buf = new_buf;
+        _buf = new_buf; // update cache to the new resident buffer
         _capacity = new_capacity;
     }
 
@@ -1645,6 +2071,31 @@ private:
             throw std::length_error("VMString exceeds single page capacity");
         if (min_capacity - 1 > _capacity)
             reallocate_page(min_capacity - 1);
+    }
+
+    /**
+     * @brief Acquire writable buffer pointer and update cache.
+     * @return Writable buffer pointer.
+     * @throws std::runtime_error If page is not available.
+     */
+    char* write_buf() const {
+        if (_page_idx < 0) return const_cast<char*>(""); // moved-from; shouldn't happen for active strings
+        char* p = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(_page_idx, 0));
+        if (!p) throw std::runtime_error("VMString: failed to acquire write buffer");
+        _buf = p;
+        return p;
+    }
+
+    /**
+     * @brief Acquire read-only buffer pointer and update cache.
+     * @return Read-only buffer pointer (never null; empty string if unavailable).
+     */
+    const char* read_buf() const {
+        if (_page_idx < 0) return "";
+        char* p = reinterpret_cast<char*>(VMManager::instance().get_read_ptr(_page_idx, 0));
+        if (!p) return "";
+        _buf = p;
+        return p;
     }
 };
 

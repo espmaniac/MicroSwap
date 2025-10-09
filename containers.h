@@ -118,24 +118,34 @@ public:
      * @return True on success.
      *
      * @note This is part of the minimal public API that user code may call.
+     * @note Portability: avoids string mode "r+"; keeps two handles (read/write).
      */
     bool begin(fs::FS& filesystem, const char* swap_path) {
         if (started) end();
         fs = &filesystem;
         fs->remove(swap_path);
 
-        File create_file = fs->open(swap_path, FILE_WRITE);
-        if (!create_file) return false;
+        // Open a write handle first. On many Arduino FS, FILE_WRITE implies truncation.
+        // We will pre-size the file by writing zeros through this handle, then keep it open.
+        swap_write = fs->open(swap_path, FILE_WRITE);
+        if (!swap_write) return false;
+
+        // Pre-size the file to the required number of pages by writing zeros.
         uint8_t zero[VM_PAGE_SIZE] = {0};
         for (size_t i = 0; i < page_count; i++) {
-            create_file.seek(i * page_size);
-            create_file.write(zero, page_size);
+            swap_write.seek(i * page_size);
+            swap_write.write(zero, page_size);
         }
-        create_file.close();
+        swap_write.flush();
 
-        swap_file = fs->open(swap_path, "r+");
-        if (!swap_file) return false;
+        // Open a separate read handle. Keeping both avoids reliance on "r+".
+        swap_read = fs->open(swap_path, FILE_READ);
+        if (!swap_read) {
+            swap_write.close();
+            return false;
+        }
 
+        // Initialize page table.
         for (size_t i = 0; i < page_count; i++) {
             pages[i].allocated    = false;
             pages[i].in_ram       = false;
@@ -178,9 +188,13 @@ public:
                 pages[i].ram_addr = nullptr;
             }
         }
-        if (swap_file) {
-            swap_file.flush();
-            swap_file.close();
+        // Flush and close both handles if present.
+        if (swap_write) {
+            swap_write.flush();
+            swap_write.close();
+        }
+        if (swap_read) {
+            swap_read.close();
         }
         fs = nullptr;
         started = false;
@@ -219,7 +233,8 @@ private:
 
     // -------------------- Private state (hidden from end users) --------------------
     VMPage pages[VM_PAGE_COUNT]; ///< Page table.
-    File swap_file;              ///< Opened swap file handle.
+    File swap_read;              ///< Read-only handle for the swap file (portable alternative to "r+").
+    File swap_write;             ///< Write handle for the swap file (kept open to avoid repeated truncation).
     fs::FS* fs = nullptr;        ///< Filesystem pointer.
     size_t page_size = VM_PAGE_SIZE; ///< Current page size (constant).
     size_t page_count = VM_PAGE_COUNT; ///< Number of pages (constant).
@@ -248,8 +263,9 @@ private:
                 pg.last_access  = ++access_tick;
 
                 if (opts.reuse_swap_data) {
-                    swap_file.seek(pg.swap_offset);
-                    swap_file.read(pg.ram_addr, page_size);
+                    // Read existing content from swap through the read handle.
+                    swap_read.seek(pg.swap_offset);
+                    swap_read.read(pg.ram_addr, page_size);
                     pg.dirty = false;
                     pg.zero_filled = false;
                 } else {
@@ -295,8 +311,8 @@ private:
         pg.last_access  = ++access_tick;
 
         if (opts.reuse_swap_data) {
-            swap_file.seek(pg.swap_offset);
-            swap_file.read(pg.ram_addr, page_size);
+            swap_read.seek(pg.swap_offset);
+            swap_read.read(pg.ram_addr, page_size);
             pg.dirty = false;
             pg.zero_filled = false;
         } else {
@@ -336,9 +352,9 @@ private:
         if (!page.in_ram || !page.ram_addr) return true;
 
         if (page.dirty || force) {
-            swap_file.seek(page.swap_offset);
-            size_t written = swap_file.write(page.ram_addr, page_size);
-            swap_file.flush();
+            swap_write.seek(page.swap_offset);
+            size_t written = swap_write.write(page.ram_addr, page_size);
+            swap_write.flush();
             (void)written;
             page.dirty = false;
         }
@@ -364,8 +380,8 @@ private:
             if (!page.ram_addr) return false;
             page.in_ram = true;
         }
-        swap_file.seek(page.swap_offset);
-        size_t readed = swap_file.read(page.ram_addr, page_size);
+        swap_read.seek(page.swap_offset);
+        size_t readed = swap_read.read(page.ram_addr, page_size);
         (void)readed;
         page.last_access = ++access_tick;
         page.dirty = false;
@@ -463,9 +479,9 @@ private:
 
         if (wipe) {
             uint8_t zero[VM_PAGE_SIZE] = {0};
-            swap_file.seek(page.swap_offset);
-            swap_file.write(zero, page_size);
-            swap_file.flush();
+            swap_write.seek(page.swap_offset);
+            swap_write.write(zero, page_size);
+            swap_write.flush();
         }
 
         if (page.ram_addr) {
@@ -551,6 +567,10 @@ public:
      * @brief Default constructor (null pointer).
      */
     VMPtr() : page_idx_(-1), offset_(0) {}
+
+#if 0
+    // Note: The rest of VMPtr remains unchanged in this patch.
+#endif
 
     /**
      * @brief Check if pointer references a valid virtual address range (index in range and offset fits page).

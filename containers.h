@@ -568,10 +568,6 @@ public:
      */
     VMPtr() : page_idx_(-1), offset_(0) {}
 
-#if 0
-    // Note: The rest of VMPtr remains unchanged in this patch.
-#endif
-
     /**
      * @brief Check if pointer references a valid virtual address range (index in range and offset fits page).
      * @return True if virtual position is well-formed.
@@ -585,58 +581,60 @@ public:
     }
 
     /**
-     * @brief Dereference pointer, ensures the page is loaded, returns reference to object.
+     * @brief Dereference pointer for write access, ensures the page is loaded, returns reference to object.
      * @return Reference to object.
-     * @throws std::runtime_error if invalid.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     T& operator*() {
         ensure_loaded();
-        return *ptr();
+        return *ptr_write();
     }
     /**
-     * @brief Dereference pointer, const version.
+     * @brief Dereference pointer for read-only access (does not mark page dirty).
      * @return Const reference to object.
-     * @throws std::runtime_error if invalid.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     const T& operator*() const {
         ensure_loaded();
-        return *ptr();
+        return *ptr_read();
     }
 
     /**
-     * @brief Member access operator.
+     * @brief Member access operator for write access.
      * @return Pointer to object.
-     * @throws std::runtime_error if invalid.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     T* operator->() {
         ensure_loaded();
-        return ptr();
+        return ptr_write();
     }
     /**
-     * @brief Member access operator, const version.
+     * @brief Member access operator for read-only access.
      * @return Const pointer to object.
-     * @throws std::runtime_error if invalid.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     const T* operator->() const {
         ensure_loaded();
-        return ptr();
+        return ptr_read();
     }
 
     /**
-     * @brief Get raw pointer to object in RAM (after swapping in).
+     * @brief Get raw pointer to object in RAM (write intent; marks page dirty).
      * @return Pointer to object.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     T* get() {
         ensure_loaded();
-        return ptr();
+        return ptr_write();
     }
     /**
-     * @brief Get const raw pointer to object in RAM (after swapping in).
+     * @brief Get const raw pointer to object in RAM (read-only; does not mark page dirty).
      * @return Const pointer to object.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
      */
     const T* get() const {
         ensure_loaded();
-        return ptr();
+        return ptr_read();
     }
 
     /**
@@ -684,30 +682,24 @@ public:
     bool operator>=(const VMPtr& other) const { return !(*this < other); }
 
     /**
-     * @brief Pointer arithmetic: addition (move forward n elements).
-     * @param n Number of elements.
+     * @brief Pointer arithmetic: addition (move forward/backward n elements).
+     * @param n Number of elements (can be negative).
      * @return New VMPtr<T> advanced by n elements.
+     * @throws std::runtime_error if called on an invalid pointer.
+     *
+     * @details Uses signed arithmetic with floor-division semantics to avoid unsigned wraparounds.
      */
     VMPtr operator+(ptrdiff_t n) const {
         if (!valid()) throw std::runtime_error("VMPtr: arithmetic on invalid pointer");
         const auto& mgr = VMManager::instance();
-        size_t element_offset = offset_ + n * sizeof(T);
-        int new_page = page_idx_;
-        size_t page_size = mgr.get_page_size();
-        // Move forward (or backward) across pages if needed
-        if (element_offset >= page_size) {
-            new_page += static_cast<int>(element_offset / page_size);
-            element_offset = element_offset % page_size;
-        } else if ((ptrdiff_t)element_offset < 0) {
-            // Move backward across pages
-            ptrdiff_t total_offset = static_cast<ptrdiff_t>(offset_) + n * static_cast<ptrdiff_t>(sizeof(T));
-            while (total_offset < 0) {
-                new_page -= 1;
-                total_offset += page_size;
-            }
-            element_offset = static_cast<size_t>(total_offset);
-        }
-        return VMPtr(new_page, element_offset);
+        const int64_t ps = static_cast<int64_t>(mgr.get_page_size());
+        const int64_t total = static_cast<int64_t>(offset_) + static_cast<int64_t>(n) * static_cast<int64_t>(sizeof(T));
+        int64_t page_delta = total / ps;
+        int64_t rem = total % ps;
+        if (rem < 0) { rem += ps; page_delta -= 1; }
+        int new_page = page_idx_ + static_cast<int>(page_delta);
+        size_t new_offset = static_cast<size_t>(rem);
+        return VMPtr(new_page, new_offset);
     }
 
     /**
@@ -765,7 +757,7 @@ public:
     VMPtr& operator-=(ptrdiff_t n) { *this = *this - n; return *this; }
 
     /**
-     * @brief Indexing operator: get reference to element at offset n.
+     * @brief Indexing operator: get reference to element at offset n (write intent for non-const).
      * @param n Index offset (can be negative).
      * @return Reference to element at offset.
      */
@@ -773,7 +765,7 @@ public:
         return *(*this + n);
     }
     /**
-     * @brief Indexing operator: get const reference to element at offset n.
+     * @brief Indexing operator: get const reference to element at offset n (read-only).
      * @param n Index offset (can be negative).
      * @return Const reference to element at offset.
      */
@@ -794,15 +786,14 @@ protected:
 
 private:
     /**
-     * @brief Ensure the referenced page is loaded into RAM, allocating it if needed.
+     * @brief Ensure the referenced page is ready: allocate if needed and load into RAM if not resident.
      *
-     * @throws std::runtime_error If virtual position is out of range or allocation fails.
+     * @throws std::runtime_error If virtual position is out of range or allocation/swap-in fails.
      */
     void ensure_loaded() const {
         auto& mgr = VMManager::instance();
-        // Resolve oversized offset into page/offset form if needed
+        // Allocate a fresh page on first-time use.
         if (page_idx_ == -1) {
-            // First-time use: allocate a fresh page.
             int new_idx = -1;
             if (!mgr.alloc_page(&new_idx, true))
                 throw std::runtime_error("VMPtr: failed to allocate page");
@@ -812,26 +803,43 @@ private:
                 throw std::runtime_error("VMPtr: page index out of range");
         }
 
-        // If target page exists but not allocated yet, allocate it in-place.
+        // Allocate specific target page if not yet allocated.
         if (!mgr.pages[page_idx_].allocated) {
             if (!mgr.alloc_page_at(page_idx_, mgr.default_alloc_options))
                 throw std::runtime_error("VMPtr: failed to allocate target page");
         }
 
-        // Ensure offset fits within the page for object T.
+        // Ensure the object fits entirely inside a single page.
         if (offset_ + sizeof(T) > mgr.get_page_size())
             throw std::runtime_error("VMPtr: object straddles page boundary");
 
-        // Ensure page is resident.
-        mgr.swap_in(page_idx_);
+        // Load into RAM only if not resident; avoid clearing dirty on freshly allocated pages.
+        if (!mgr.pages[page_idx_].in_ram || !mgr.pages[page_idx_].ram_addr) {
+            if (!mgr.swap_in(page_idx_))
+                throw std::runtime_error("VMPtr: failed to swap-in page");
+        }
     }
 
     /**
-     * @brief Get pointer to the object in RAM.
-     * @return Pointer to object.
+     * @brief Acquire writable pointer to the object (marks page dirty).
+     * @return Writable pointer to object (never null on success).
+     * @throws std::runtime_error If pointer acquisition fails.
      */
-    T* ptr() const {
-        return reinterpret_cast<T*>(VMManager::instance().get_write_ptr(page_idx_, offset_));
+    T* ptr_write() const {
+        T* p = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(page_idx_, offset_));
+        if (!p) throw std::runtime_error("VMPtr: failed to acquire write pointer");
+        return p;
+    }
+
+    /**
+     * @brief Acquire read-only pointer to the object (does not mark page dirty).
+     * @return Read-only pointer to object (never null on success).
+     * @throws std::runtime_error If pointer acquisition fails.
+     */
+    const T* ptr_read() const {
+        const T* p = reinterpret_cast<const T*>(VMManager::instance().get_read_ptr(page_idx_, offset_));
+        if (!p) throw std::runtime_error("VMPtr: failed to acquire read pointer");
+        return p;
     }
 
     mutable int page_idx_;   ///< Index of page in VMManager (auto-allocated on demand).

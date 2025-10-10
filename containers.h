@@ -838,6 +838,173 @@ private:
         if (mark_dirty_flag) page.dirty = true;
         return page.ram_addr + offset;
     }
+
+    // -------------------- Private allocator wrappers (page-level) --------------------
+
+    /**
+     * @brief Allocate a page with options (wrapper over alloc_page_ex).
+     * @param out_idx Output page index.
+     * @param opts Allocation options.
+     * @return True on success, false on failure.
+     */
+    bool page_alloc(int& out_idx, const AllocOptions& opts) {
+        int idx = -1;
+        uint8_t* ptr = alloc_page_ex(opts, &idx);
+        if (ptr) {
+            out_idx = idx;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Allocate a page with default options (wrapper over alloc_page_ex).
+     * @param out_idx Output page index.
+     * @return True on success, false on failure.
+     */
+    bool page_alloc(int& out_idx) {
+        return page_alloc(out_idx, default_alloc_options);
+    }
+
+    /**
+     * @brief Free a page (wrapper over free_page).
+     * @param idx Page index.
+     * @param wipe If true, overwrite swap content with zeros.
+     * @return True on success.
+     */
+    bool page_free(int idx, bool wipe = false) {
+        return free_page(idx, wipe);
+    }
+
+    /**
+     * @brief Get read-only pointer to page data (wrapper over get_read_ptr).
+     * @param idx Page index.
+     * @param offset Offset in bytes.
+     * @return Pointer or nullptr.
+     */
+    void* page_read_ptr(int idx, size_t offset) {
+        return get_read_ptr(idx, offset);
+    }
+
+    /**
+     * @brief Get writable pointer to page data (wrapper over get_write_ptr).
+     * @param idx Page index.
+     * @param offset Offset in bytes.
+     * @return Pointer or nullptr.
+     */
+    void* page_write_ptr(int idx, size_t offset) {
+        return get_write_ptr(idx, offset);
+    }
+
+    /**
+     * @brief Flush a page to disk (wrapper over flush_page).
+     * @param idx Page index.
+     * @return True on success.
+     */
+    bool page_flush(int idx) {
+        return flush_page(idx);
+    }
+
+    /**
+     * @brief Prefetch/swap-in a page (wrapper over swap_in).
+     * @param idx Page index.
+     * @return True on success.
+     */
+    bool page_prefetch(int idx) {
+        return swap_in(idx);
+    }
+
+    // -------------------- Private allocator wrappers (small-block) --------------------
+
+    /**
+     * @brief Allocate a small block from heap pages (wrapper over heap_alloc).
+     * @param size Requested payload size.
+     * @param align Alignment (passed through but may be ignored by heap_alloc).
+     * @param out_page Output page index.
+     * @param out_off Output payload offset.
+     * @param out_alloc_size Output actual allocated size.
+     * @return True on success.
+     */
+    bool small_alloc(size_t size, size_t align, int& out_page, size_t& out_off, size_t& out_alloc_size) {
+        int pg = -1;
+        size_t off = 0;
+        size_t sz = 0;
+        if (heap_alloc(size, align, &pg, &off, &sz)) {
+            out_page = pg;
+            out_off = off;
+            out_alloc_size = sz;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Free a small block (wrapper over heap_free).
+     * @param page_idx Page index.
+     * @param payload_off Payload offset.
+     */
+    void small_free(int page_idx, size_t payload_off) {
+        heap_free(page_idx, payload_off);
+    }
+
+    /**
+     * @brief Get read-only pointer to small-block payload.
+     * @param page_idx Page index.
+     * @param payload_off Payload offset.
+     * @return Pointer or nullptr.
+     */
+    void* small_read_ptr(int page_idx, size_t payload_off) {
+        return get_read_ptr(page_idx, payload_off);
+    }
+
+    /**
+     * @brief Get writable pointer to small-block payload.
+     * @param page_idx Page index.
+     * @param payload_off Payload offset.
+     * @return Pointer or nullptr.
+     */
+    void* small_write_ptr(int page_idx, size_t payload_off) {
+        return get_write_ptr(page_idx, payload_off);
+    }
+
+    /**
+     * @brief Reallocate a small block by allocating new, copying, and freeing old.
+     * @param old_page Old page index.
+     * @param old_off Old payload offset.
+     * @param new_min_size New minimum size required.
+     * @param new_page Output new page index.
+     * @param new_off Output new payload offset.
+     * @param new_alloc_size Output new allocated size.
+     * @param copy_bytes Number of bytes to copy from old to new.
+     * @return True on success.
+     */
+    bool small_realloc_move(int old_page, size_t old_off, size_t new_min_size,
+                            int& new_page, size_t& new_off, size_t& new_alloc_size,
+                            size_t copy_bytes) {
+        // Allocate new block
+        int np = -1;
+        size_t noff = 0;
+        size_t nsize = 0;
+        if (!small_alloc(new_min_size, 1, np, noff, nsize)) {
+            return false;
+        }
+        // Copy data from old to new
+        size_t to_copy = std::min(copy_bytes, nsize);
+        if (to_copy > 0) {
+            void* old_ptr = small_read_ptr(old_page, old_off);
+            void* new_ptr = small_write_ptr(np, noff);
+            if (old_ptr && new_ptr) {
+                memcpy(new_ptr, old_ptr, to_copy);
+            }
+        }
+        // Free old block
+        small_free(old_page, old_off);
+        // Return new allocation info
+        new_page = np;
+        new_off = noff;
+        new_alloc_size = nsize;
+        return true;
+    }
 };
 
 /**
@@ -1096,7 +1263,7 @@ private:
             int new_idx = -1;
             size_t new_off = 0;
             size_t alloc_sz = 0;
-            if (!mgr.heap_alloc(sizeof(T), alignof(T), &new_idx, &new_off, &alloc_sz))
+            if (!mgr.small_alloc(sizeof(T), alignof(T), new_idx, new_off, alloc_sz))
                 throw std::runtime_error("VMPtr: failed to heap-allocate storage");
             page_idx_ = new_idx;
             offset_   = new_off;
@@ -1111,7 +1278,7 @@ private:
 
         // Load into RAM only if not resident.
         if (!mgr.pages[page_idx_].in_ram || !mgr.pages[page_idx_].ram_addr) {
-            if (!mgr.swap_in(page_idx_))
+            if (!mgr.page_prefetch(page_idx_))
                 throw std::runtime_error("VMPtr: failed to swap-in page");
         }
     }
@@ -1122,7 +1289,7 @@ private:
      * @throws std::runtime_error If pointer acquisition fails.
      */
     T* ptr_write() const {
-        T* p = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(page_idx_, offset_));
+        T* p = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(page_idx_, offset_));
         if (!p) throw std::runtime_error("VMPtr: failed to acquire write pointer");
         return p;
     }
@@ -1133,7 +1300,7 @@ private:
      * @throws std::runtime_error If pointer acquisition fails.
      */
     const T* ptr_read() const {
-        const T* p = reinterpret_cast<const T*>(VMManager::instance().get_read_ptr(page_idx_, offset_));
+        const T* p = reinterpret_cast<const T*>(VMManager::instance().small_read_ptr(page_idx_, offset_));
         if (!p) throw std::runtime_error("VMPtr: failed to acquire read pointer");
         return p;
     }
@@ -1358,7 +1525,7 @@ public:
         size_type chunk_num = idx / _chunk_capacity;
         size_type offset    = idx % _chunk_capacity;
         Chunk& ch = _chunks[chunk_num];
-        return *reinterpret_cast<T*>(VMManager::instance().get_write_ptr(ch.page_idx, offset * sizeof(T)));
+        return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, offset * sizeof(T)));
     }
     /**
      * @brief Unchecked element access (read intent).
@@ -1369,7 +1536,7 @@ public:
         size_type chunk_num = idx / _chunk_capacity;
         size_type offset    = idx % _chunk_capacity;
         const Chunk& ch = _chunks[chunk_num];
-        return *reinterpret_cast<const T*>(VMManager::instance().get_read_ptr(ch.page_idx, offset * sizeof(T)));
+        return *reinterpret_cast<const T*>(VMManager::instance().page_read_ptr(ch.page_idx, offset * sizeof(T)));
     }
     /**
      * @brief Bounds-checked element access.
@@ -1424,7 +1591,7 @@ public:
     void push_back(const T& value) {
         ensure_back_slot();
         Chunk& ch = _chunks[_chunk_count - 1];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(ch.page_idx, ch.count * sizeof(T)));
+        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
         new(ptr) T(value);
         ch.count++; _size++;
     }
@@ -1439,7 +1606,7 @@ public:
     reference emplace_back(Args&&... args) {
         ensure_back_slot();
         Chunk& ch = _chunks[_chunk_count - 1];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(ch.page_idx, ch.count * sizeof(T)));
+        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
         new(ptr) T(std::forward<Args>(args)...);
         ch.count++; _size++;
         return *ptr;
@@ -1474,11 +1641,11 @@ public:
         size_type offset    = _size % _chunk_capacity;
         if (offset == 0 && chunk_num > 0) chunk_num--;
         Chunk& ch = _chunks[chunk_num];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(ch.page_idx, (ch.count - 1) * sizeof(T)));
+        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, (ch.count - 1) * sizeof(T)));
         ptr->~T();
         ch.count--;
         if (ch.count == 0) {
-            VMManager::instance().free_page(ch.page_idx);
+            VMManager::instance().page_free(ch.page_idx);
             ch.page_idx = -1;
             _chunk_count--;
         }
@@ -1521,10 +1688,10 @@ public:
             Chunk& ch = _chunks[i];
             if (ch.page_idx == -1) continue;
             for (size_type j = 0; j < ch.count; ++j) {
-                T* ptr = reinterpret_cast<T*>(VMManager::instance().get_write_ptr(ch.page_idx, j * sizeof(T)));
+                T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, j * sizeof(T)));
                 ptr->~T();
             }
-            VMManager::instance().free_page(ch.page_idx);
+            VMManager::instance().page_free(ch.page_idx);
             ch.page_idx = -1;
             ch.count = 0;
         }
@@ -1552,8 +1719,12 @@ public:
     void reserve(size_type n) {
         size_type required_chunks = (n + _chunk_capacity - 1) / _chunk_capacity;
         while (_chunk_count < required_chunks) {
-            int page_idx;
-            VMManager::instance().alloc_page(&page_idx, true);
+            int page_idx = -1;
+            VMManager::AllocOptions opts;
+            opts.can_free_ram = true;
+            opts.zero_on_alloc = true;
+            opts.reuse_swap_data = false;
+            VMManager::instance().page_alloc(page_idx, opts);
             _chunks[_chunk_count].page_idx = page_idx;
             _chunks[_chunk_count].count = 0;
             _chunk_count++;
@@ -1567,7 +1738,7 @@ public:
         size_type used_chunks = (_size + _chunk_capacity - 1) / _chunk_capacity;
         for (size_type i = used_chunks; i < _chunk_count; ++i) {
             if (_chunks[i].page_idx != -1) {
-                VMManager::instance().free_page(_chunks[i].page_idx);
+                VMManager::instance().page_free(_chunks[i].page_idx);
                 _chunks[i].page_idx = -1;
                 _chunks[i].count = 0;
             }
@@ -1667,8 +1838,12 @@ private:
      */
     void ensure_back_slot() {
         if (_chunk_count == 0 || _chunks[_chunk_count - 1].count >= _chunk_capacity) {
-            int page_idx;
-            VMManager::instance().alloc_page(&page_idx, true);
+            int page_idx = -1;
+            VMManager::AllocOptions opts;
+            opts.can_free_ram = true;
+            opts.zero_on_alloc = true;
+            opts.reuse_swap_data = false;
+            VMManager::instance().page_alloc(page_idx, opts);
             _chunks[_chunk_count].page_idx = page_idx;
             _chunks[_chunk_count].count = 0;
             _chunk_count++;
@@ -1701,11 +1876,17 @@ public:
     using const_reverse_iterator = detail::GenericReverseIterator<const_iterator>;
 
     /// Constructor allocates one page.
-    VMArray() { VMManager::instance().alloc_page(&page_idx, true); }
+    VMArray() {
+        VMManager::AllocOptions opts;
+        opts.can_free_ram = true;
+        opts.zero_on_alloc = true;
+        opts.reuse_swap_data = false;
+        VMManager::instance().page_alloc(page_idx, opts);
+    }
     /// Destructor frees page.
     ~VMArray() {
         if (page_idx >= 0) {
-            VMManager::instance().free_page(page_idx);
+            VMManager::instance().page_free(page_idx);
             page_idx = -1;
         }
     }
@@ -1716,7 +1897,7 @@ public:
      * @return Reference.
      */
     reference operator[](size_type idx) {
-        return *reinterpret_cast<T*>(VMManager::instance().get_write_ptr(page_idx, idx * sizeof(T)));
+        return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(page_idx, idx * sizeof(T)));
     }
     /**
      * @brief Unchecked element access (read intent).
@@ -1724,7 +1905,7 @@ public:
      * @return Const reference.
      */
     const_reference operator[](size_type idx) const {
-        return *reinterpret_cast<const T*>(VMManager::instance().get_read_ptr(page_idx, idx * sizeof(T)));
+        return *reinterpret_cast<const T*>(VMManager::instance().page_read_ptr(page_idx, idx * sizeof(T)));
     }
     /**
      * @brief Bounds-checked access.
@@ -1764,7 +1945,7 @@ public:
     void clear() {
         for (size_type i = 0; i < N; ++i)
             (*this)[i] = T();
-        VMManager::instance().swap_out(page_idx);
+        VMManager::instance().page_flush(page_idx);
     }
 
     // Iterators
@@ -1852,7 +2033,7 @@ public:
     VMString& operator=(VMString&& other) noexcept {
         if (this != &other) {
             // free current block
-            if (_page_idx >= 0) VMManager::instance().heap_free(_page_idx, _offset);
+            if (_page_idx >= 0) VMManager::instance().small_free(_page_idx, _offset);
             _page_idx = other._page_idx;
             _offset   = other._offset;
             _buf      = other._buf;
@@ -1870,7 +2051,7 @@ public:
     /// Destructor frees heap block.
     ~VMString() {
         if (_page_idx >= 0) {
-            VMManager::instance().heap_free(_page_idx, _offset);
+            VMManager::instance().small_free(_page_idx, _offset);
             _buf = nullptr;
             _page_idx = -1;
             _offset = 0;
@@ -2342,7 +2523,7 @@ public:
             char* buf = write_buf();
             buf[0] = '\0';
             _size = 0;
-            VMManager::instance().swap_out(_page_idx);
+            VMManager::instance().page_flush(_page_idx);
             _buf = nullptr; // avoid stale pointer after potential RAM free
         } else {
             _size = 0;
@@ -2361,14 +2542,14 @@ private:
      * @param min_capacity Required capacity hint (within a single heap block).
      */
     void allocate_initial_block(size_type min_capacity) {
-        int pidx;
+        int pidx = -1;
         size_t off = 0;
         size_t alloc_sz = 0;
         size_t need = (min_capacity + 1); // include null
         if (need < 1) need = 1;
         if (need > VMManager::instance().heap_max_payload())
             need = VMManager::instance().heap_max_payload();
-        if (!VMManager::instance().heap_alloc(need, alignof(char), &pidx, &off, &alloc_sz))
+        if (!VMManager::instance().small_alloc(need, alignof(char), pidx, off, alloc_sz))
             throw std::runtime_error("VMString: heap_alloc failed");
         _page_idx = pidx;
         _offset = off;
@@ -2382,13 +2563,13 @@ private:
      * @param min_capacity Required capacity (excluding null).
      */
     void reallocate_block(size_type min_capacity) {
-        int new_page_idx;
+        int new_page_idx = -1;
         size_t new_off = 0;
         size_t new_alloc = 0;
         size_t need = min_capacity; // includes null already when called
-        if (!VMManager::instance().heap_alloc(need, alignof(char), &new_page_idx, &new_off, &new_alloc))
+        if (!VMManager::instance().small_alloc(need, alignof(char), new_page_idx, new_off, new_alloc))
             throw std::length_error("VMString::reserve: cannot allocate requested capacity");
-        char* new_buf = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(new_page_idx, new_off));
+        char* new_buf = reinterpret_cast<char*>(VMManager::instance().small_write_ptr(new_page_idx, new_off));
         size_type copy_len = std::min(_size, new_alloc > 0 ? (new_alloc - 1) : 0);
         if (copy_len) {
             const char* src = read_buf();
@@ -2399,7 +2580,7 @@ private:
 
         // Free old block
         if (_page_idx >= 0) {
-            VMManager::instance().heap_free(_page_idx, _offset);
+            VMManager::instance().small_free(_page_idx, _offset);
         }
 
         // Update to new location
@@ -2427,7 +2608,7 @@ private:
      */
     char* write_buf() const {
         if (_page_idx < 0) return const_cast<char*>(""); // moved-from; shouldn't happen for active strings
-        char* p = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(_page_idx, _offset));
+        char* p = reinterpret_cast<char*>(VMManager::instance().small_write_ptr(_page_idx, _offset));
         if (!p) throw std::runtime_error("VMString: failed to acquire write buffer");
         _buf = p;
         return p;
@@ -2439,7 +2620,7 @@ private:
      */
     const char* read_buf() const {
         if (_page_idx < 0) return "";
-        char* p = reinterpret_cast<char*>(VMManager::instance().get_read_ptr(_page_idx, _offset));
+        char* p = reinterpret_cast<char*>(VMManager::instance().small_read_ptr(_page_idx, _offset));
         if (!p) return "";
         _buf = p;
         return p;

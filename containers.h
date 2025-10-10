@@ -1486,7 +1486,7 @@ public:
 
     /// Move constructor.
     VMVector(VMVector&& other) noexcept
-        : _chunk_capacity(other._chunk_capacity), _size(other._size), _chunk_count(other._chunk_count),
+        : _chunk_capacity(other._chunk_capacity), _chunk_count(other._chunk_count), _size(other._size),
           _flat_mode(other._flat_mode), _flat_page(other._flat_page), 
           _flat_offset(other._flat_offset), _flat_capacity(other._flat_capacity) {
         for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
@@ -1494,8 +1494,8 @@ public:
             other._chunks[i].page_idx = -1;
             other._chunks[i].count = 0;
         }
-        other._size = 0;
         other._chunk_count = 0;
+        other._size = 0;
         other._flat_mode = true;
         other._flat_page = -1;
         other._flat_offset = 0;

@@ -844,19 +844,26 @@ private:
     /**
      * @brief Allocate a page with options (wrapper over alloc_page_ex).
      * @param out_idx Output page index.
-     * @param opts Allocation options (default if omitted).
+     * @param opts Allocation options.
      * @return True on success, false on failure.
      */
-    bool page_alloc(int& out_idx, const AllocOptions& opts = AllocOptions()) {
-        AllocOptions used_opts = opts;
-        // If opts are default-constructed, use manager's defaults
+    bool page_alloc(int& out_idx, const AllocOptions& opts) {
         int idx = -1;
-        uint8_t* ptr = alloc_page_ex(used_opts, &idx);
+        uint8_t* ptr = alloc_page_ex(opts, &idx);
         if (ptr) {
             out_idx = idx;
             return true;
         }
         return false;
+    }
+
+    /**
+     * @brief Allocate a page with default options (wrapper over alloc_page_ex).
+     * @param out_idx Output page index.
+     * @return True on success, false on failure.
+     */
+    bool page_alloc(int& out_idx) {
+        return page_alloc(out_idx, default_alloc_options);
     }
 
     /**

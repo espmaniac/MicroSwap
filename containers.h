@@ -22,12 +22,18 @@
  *  - VMPtr<T> performs lazy allocation and swap-in, supports pointer arithmetic and indexing, and keeps write intent explicit.
  *  - Containers (vector / array / string) using pages as backing storage with iterators (including reverse iterators)
  *    and bounds-checked at().
+ *  - Small-block heap allocator enabling multiple small objects/arrays to share pages efficiently.
+ *
+ * Recent improvements:
+ *  - VMArray now uses small-heap blocks instead of dedicating entire pages, enabling better memory utilization.
+ *  - VMVector features hybrid mode: starts with flat contiguous storage (enabling data() access) and automatically
+ *    transitions to paged mode when size exceeds single-block capacity.
+ *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
+ *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
  *
  * Limitations:
  *  - VMArray does not call constructors/destructors for non-trivial types.
- *  - VMVector cannot expose a contiguous data() buffer because elements span pages.
- *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
- *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
+ *  - VMVector data() is only available in flat mode (small vectors); returns nullptr after transition to paged mode.
  *
  * Usage scenario:
  *  - Helps when RAM is scarce and some data can reside in a swap file when inactive.
@@ -238,8 +244,8 @@ private:
 
     // -------------------- Private state (hidden from end users) --------------------
     VMPage pages[VM_PAGE_COUNT]; ///< Page table.
-    File swap_read;              ///< Read-only handle for the swap file (portable alternative to "r+").
-    File swap_write;             ///< Write handle for the swap file (kept open to avoid repeated truncation).
+    fs::File swap_read;              ///< Read-only handle for the swap file (portable alternative to "r+").
+    fs::File swap_write;             ///< Write handle for the swap file (kept open to avoid repeated truncation).
     fs::FS* fs = nullptr;        ///< Filesystem pointer.
     size_t page_size = VM_PAGE_SIZE; ///< Current page size (constant).
     size_t page_count = VM_PAGE_COUNT; ///< Number of pages (constant).
@@ -1440,11 +1446,14 @@ private:
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Vector-like container backed by pageable storage.
+ * @brief Vector-like container backed by pageable storage with hybrid mode.
  * @tparam T Element type.
  * @note Not fully STL-compatible; no allocator support. Iterators become invalid
  *       after modifications similar to std::vector in some operations.
- * @warning Elements spanning pages means no contiguous single block; data() unsupported.
+ * @details
+ * Hybrid mode: Small vectors start in "flat" mode using a single contiguous heap block,
+ * enabling data() access. When size exceeds flat capacity, transitions to "paged" mode
+ * spanning multiple pages (data() becomes unavailable).
  */
 template<typename T>
 class VMVector {
@@ -1460,8 +1469,9 @@ public:
     using reverse_iterator       = detail::GenericReverseIterator<iterator>;
     using const_reverse_iterator = detail::GenericReverseIterator<const_iterator>;
 
-    /// Default constructor.
-    VMVector() : _chunk_capacity(VM_PAGE_SIZE / sizeof(T)), _size(0), _chunk_count(0) {
+    /// Default constructor (starts in flat mode).
+    VMVector() : _chunk_capacity(VM_PAGE_SIZE / sizeof(T)), _chunk_count(0), _size(0),
+                 _flat_mode(true), _flat_page(-1), _flat_offset(0), _flat_capacity(0) {
         for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
             _chunks[i].page_idx = -1;
             _chunks[i].count = 0;
@@ -1476,14 +1486,20 @@ public:
 
     /// Move constructor.
     VMVector(VMVector&& other) noexcept
-        : _chunk_capacity(other._chunk_capacity), _size(other._size), _chunk_count(other._chunk_count) {
+        : _chunk_capacity(other._chunk_capacity), _chunk_count(other._chunk_count), _size(other._size),
+          _flat_mode(other._flat_mode), _flat_page(other._flat_page), 
+          _flat_offset(other._flat_offset), _flat_capacity(other._flat_capacity) {
         for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
             _chunks[i] = other._chunks[i];
             other._chunks[i].page_idx = -1;
             other._chunks[i].count = 0;
         }
-        other._size = 0;
         other._chunk_count = 0;
+        other._size = 0;
+        other._flat_mode = true;
+        other._flat_page = -1;
+        other._flat_offset = 0;
+        other._flat_capacity = 0;
     }
 
     /// Copy assignment.
@@ -1501,6 +1517,10 @@ public:
             _chunk_capacity = other._chunk_capacity;
             _size           = other._size;
             _chunk_count    = other._chunk_count;
+            _flat_mode      = other._flat_mode;
+            _flat_page      = other._flat_page;
+            _flat_offset    = other._flat_offset;
+            _flat_capacity  = other._flat_capacity;
             for (size_type i = 0; i < VM_PAGE_COUNT; ++i) {
                 _chunks[i] = other._chunks[i];
                 other._chunks[i].page_idx = -1;
@@ -1508,6 +1528,10 @@ public:
             }
             other._size = 0;
             other._chunk_count = 0;
+            other._flat_mode = true;
+            other._flat_page = -1;
+            other._flat_offset = 0;
+            other._flat_capacity = 0;
         }
         return *this;
     }
@@ -1522,10 +1546,15 @@ public:
      * @return Reference.
      */
     reference operator[](size_type idx) {
-        size_type chunk_num = idx / _chunk_capacity;
-        size_type offset    = idx % _chunk_capacity;
-        Chunk& ch = _chunks[chunk_num];
-        return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, offset * sizeof(T)));
+        if (_flat_mode) {
+            T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+            return base[idx];
+        } else {
+            size_type chunk_num = idx / _chunk_capacity;
+            size_type offset    = idx % _chunk_capacity;
+            Chunk& ch = _chunks[chunk_num];
+            return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, offset * sizeof(T)));
+        }
     }
     /**
      * @brief Unchecked element access (read intent).
@@ -1533,10 +1562,15 @@ public:
      * @return Const reference.
      */
     const_reference operator[](size_type idx) const {
-        size_type chunk_num = idx / _chunk_capacity;
-        size_type offset    = idx % _chunk_capacity;
-        const Chunk& ch = _chunks[chunk_num];
-        return *reinterpret_cast<const T*>(VMManager::instance().page_read_ptr(ch.page_idx, offset * sizeof(T)));
+        if (_flat_mode) {
+            const T* base = reinterpret_cast<const T*>(VMManager::instance().small_read_ptr(_flat_page, _flat_offset));
+            return base[idx];
+        } else {
+            size_type chunk_num = idx / _chunk_capacity;
+            size_type offset    = idx % _chunk_capacity;
+            const Chunk& ch = _chunks[chunk_num];
+            return *reinterpret_cast<const T*>(VMManager::instance().page_read_ptr(ch.page_idx, offset * sizeof(T)));
+        }
     }
     /**
      * @brief Bounds-checked element access.
@@ -1581,14 +1615,53 @@ public:
     bool empty() const { return _size == 0; }
     /// Number of elements.
     size_type size() const { return _size; }
-    /// Current capacity in elements (sum of allocated chunks).
-    size_type capacity() const { return _chunk_count * _chunk_capacity; }
+    /// Current capacity in elements (sum of allocated chunks or flat capacity).
+    size_type capacity() const { 
+        return _flat_mode ? _flat_capacity : (_chunk_count * _chunk_capacity); 
+    }
+
+    /**
+     * @brief Check if vector is in flat contiguous mode.
+     * @return True if in flat mode (data() is available).
+     */
+    bool is_flat() const { return _flat_mode; }
+
+    /**
+     * @brief Get pointer to contiguous data (only available in flat mode).
+     * @return Pointer to data, or nullptr if not in flat mode.
+     * @note Only valid while vector remains in flat mode. Operations that
+     *       cause transition to paged mode will invalidate this pointer.
+     */
+    T* data() {
+        if (!_flat_mode || _flat_page < 0) return nullptr;
+        return reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+    }
+
+    /**
+     * @brief Get const pointer to contiguous data (only available in flat mode).
+     * @return Const pointer to data, or nullptr if not in flat mode.
+     */
+    const T* data() const {
+        if (!_flat_mode || _flat_page < 0) return nullptr;
+        return reinterpret_cast<const T*>(VMManager::instance().small_read_ptr(_flat_page, _flat_offset));
+    }
 
     /**
      * @brief Append element by copy.
      * @param value Value to copy.
      */
     void push_back(const T& value) {
+        if (_flat_mode) {
+            ensure_flat_back_slot();
+            if (_flat_mode) {
+                // Still in flat mode
+                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+                new(&base[_size]) T(value);
+                _size++;
+                return;
+            }
+        }
+        // Paged mode (or transitioned to paged)
         ensure_back_slot();
         Chunk& ch = _chunks[_chunk_count - 1];
         T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
@@ -1604,6 +1677,17 @@ public:
      */
     template<typename... Args>
     reference emplace_back(Args&&... args) {
+        if (_flat_mode) {
+            ensure_flat_back_slot();
+            if (_flat_mode) {
+                // Still in flat mode
+                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+                new(&base[_size]) T(std::forward<Args>(args)...);
+                _size++;
+                return base[_size - 1];
+            }
+        }
+        // Paged mode (or transitioned to paged)
         ensure_back_slot();
         Chunk& ch = _chunks[_chunk_count - 1];
         T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
@@ -1636,6 +1720,13 @@ public:
      */
     void pop_back() {
         if (_size == 0) throw std::out_of_range("VMVector::pop_back");
+        if (_flat_mode) {
+            T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+            base[_size - 1].~T();
+            _size--;
+            return;
+        }
+        // Paged mode
         _size--;
         size_type chunk_num = _size / _chunk_capacity;
         size_type offset    = _size % _chunk_capacity;
@@ -1684,18 +1775,33 @@ public:
      * @brief Destroy all elements and free pages.
      */
     void clear() {
-        for (size_type i = 0; i < _chunk_count; ++i) {
-            Chunk& ch = _chunks[i];
-            if (ch.page_idx == -1) continue;
-            for (size_type j = 0; j < ch.count; ++j) {
-                T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, j * sizeof(T)));
-                ptr->~T();
+        if (_flat_mode) {
+            // Destroy elements in flat mode
+            if (_flat_page >= 0 && _size > 0) {
+                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+                for (size_type i = 0; i < _size; ++i) {
+                    base[i].~T();
+                }
+                VMManager::instance().small_free(_flat_page, _flat_offset);
+                _flat_page = -1;
+                _flat_offset = 0;
+                _flat_capacity = 0;
             }
-            VMManager::instance().page_free(ch.page_idx);
-            ch.page_idx = -1;
-            ch.count = 0;
+        } else {
+            // Original paged mode cleanup
+            for (size_type i = 0; i < _chunk_count; ++i) {
+                Chunk& ch = _chunks[i];
+                if (ch.page_idx == -1) continue;
+                for (size_type j = 0; j < ch.count; ++j) {
+                    T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, j * sizeof(T)));
+                    ptr->~T();
+                }
+                VMManager::instance().page_free(ch.page_idx);
+                ch.page_idx = -1;
+                ch.count = 0;
+            }
+            _chunk_count = 0;
         }
-        _chunk_count = 0;
         _size = 0;
     }
 
@@ -1829,12 +1935,114 @@ private:
     };
 
     Chunk _chunks[VM_PAGE_COUNT]; ///< Fixed chunk table (one per possible page).
-    size_type _chunk_count;       ///< Active chunk count.
     size_type _chunk_capacity;    ///< Elements per chunk.
+    size_type _chunk_count;       ///< Active chunk count.
     size_type _size;              ///< Total elements.
+    
+    // Flat mode members
+    bool _flat_mode;              ///< True if using contiguous flat block.
+    int _flat_page;               ///< Page index for flat block.
+    size_t _flat_offset;          ///< Offset within page for flat block.
+    size_type _flat_capacity;     ///< Capacity in elements for flat block.
 
     /**
-     * @brief Ensure space for one more element, allocate new page if needed.
+     * @brief Ensure space for one more element in flat mode; transition to paged if needed.
+     */
+    void ensure_flat_back_slot() {
+        // First-time allocation in flat mode
+        if (_flat_page < 0) {
+            // Start with a reasonable initial capacity
+            size_t initial_cap = 16; // elements
+            if (initial_cap * sizeof(T) > VMManager::instance().heap_max_payload()) {
+                initial_cap = VMManager::instance().heap_max_payload() / sizeof(T);
+            }
+            if (initial_cap < 1) initial_cap = 1;
+            
+            size_t needed = initial_cap * sizeof(T);
+            size_t alloc_sz = 0;
+            if (VMManager::instance().small_alloc(needed, alignof(T), _flat_page, _flat_offset, alloc_sz)) {
+                _flat_capacity = alloc_sz / sizeof(T);
+                return;
+            }
+            // If small_alloc fails, transition to paged mode immediately
+            transition_to_paged();
+            return;
+        }
+        
+        // Check if we have space
+        if (_size < _flat_capacity) {
+            return; // Space available
+        }
+        
+        // Try to grow the flat buffer
+        size_t new_cap = _flat_capacity * 2;
+        if (new_cap * sizeof(T) > VMManager::instance().heap_max_payload()) {
+            // Can't fit in a single heap block, must transition to paged
+            transition_to_paged();
+            return;
+        }
+        
+        // Try reallocation
+        int new_page = -1;
+        size_t new_offset = 0;
+        size_t new_alloc = 0;
+        size_t needed = new_cap * sizeof(T);
+        size_t copy_bytes = _size * sizeof(T);
+        
+        if (VMManager::instance().small_realloc_move(_flat_page, _flat_offset, needed,
+                                                      new_page, new_offset, new_alloc, copy_bytes)) {
+            _flat_page = new_page;
+            _flat_offset = new_offset;
+            _flat_capacity = new_alloc / sizeof(T);
+            return;
+        }
+        
+        // Reallocation failed, transition to paged mode
+        transition_to_paged();
+    }
+    
+    /**
+     * @brief Transition from flat mode to paged mode.
+     */
+    void transition_to_paged() {
+        if (!_flat_mode) return;
+        
+        // Copy existing elements from flat buffer to paged chunks
+        if (_size > 0 && _flat_page >= 0) {
+            T* flat_base = reinterpret_cast<T*>(VMManager::instance().small_read_ptr(_flat_page, _flat_offset));
+            
+            // Allocate chunks as needed and copy elements
+            for (size_type i = 0; i < _size; ++i) {
+                if (_chunk_count == 0 || _chunks[_chunk_count - 1].count >= _chunk_capacity) {
+                    int page_idx = -1;
+                    VMManager::AllocOptions opts;
+                    opts.can_free_ram = true;
+                    opts.zero_on_alloc = true;
+                    opts.reuse_swap_data = false;
+                    VMManager::instance().page_alloc(page_idx, opts);
+                    _chunks[_chunk_count].page_idx = page_idx;
+                    _chunks[_chunk_count].count = 0;
+                    _chunk_count++;
+                }
+                
+                Chunk& ch = _chunks[_chunk_count - 1];
+                T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
+                new(ptr) T(flat_base[i]); // Copy construct
+                ch.count++;
+            }
+            
+            // Free the flat buffer
+            VMManager::instance().small_free(_flat_page, _flat_offset);
+        }
+        
+        _flat_mode = false;
+        _flat_page = -1;
+        _flat_offset = 0;
+        _flat_capacity = 0;
+    }
+
+    /**
+     * @brief Ensure space for one more element, allocate new page if needed (paged mode).
      */
     void ensure_back_slot() {
         if (_chunk_count == 0 || _chunks[_chunk_count - 1].count >= _chunk_capacity) {
@@ -1856,10 +2064,11 @@ private:
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Fixed-size array backed by a single page.
+ * @brief Fixed-size array backed by a small-heap block.
  * @tparam T Element type.
  * @tparam N Number of elements.
  * @warning Does not invoke constructors/destructors for non-trivial types.
+ * @details Now uses VMManager small-block heap so multiple arrays can share pages efficiently.
  */
 template<typename T, size_t N>
 class VMArray {
@@ -1875,18 +2084,23 @@ public:
     using reverse_iterator       = detail::GenericReverseIterator<iterator>;
     using const_reverse_iterator = detail::GenericReverseIterator<const_iterator>;
 
-    /// Constructor allocates one page.
-    VMArray() {
-        VMManager::AllocOptions opts;
-        opts.can_free_ram = true;
-        opts.zero_on_alloc = true;
-        opts.reuse_swap_data = false;
-        VMManager::instance().page_alloc(page_idx, opts);
+    /// Constructor allocates from small-heap blocks.
+    VMArray() : page_idx(-1), offset(0) {
+        size_t needed = N * sizeof(T);
+        size_t alloc_sz = 0;
+        if (!VMManager::instance().small_alloc(needed, alignof(T), page_idx, offset, alloc_sz)) {
+            throw std::runtime_error("VMArray: small_alloc failed");
+        }
+        // Zero-initialize the allocated block
+        void* ptr = VMManager::instance().small_write_ptr(page_idx, offset);
+        if (ptr) {
+            memset(ptr, 0, alloc_sz);
+        }
     }
-    /// Destructor frees page.
+    /// Destructor frees heap block.
     ~VMArray() {
         if (page_idx >= 0) {
-            VMManager::instance().page_free(page_idx);
+            VMManager::instance().small_free(page_idx, offset);
             page_idx = -1;
         }
     }
@@ -1897,7 +2111,8 @@ public:
      * @return Reference.
      */
     reference operator[](size_type idx) {
-        return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(page_idx, idx * sizeof(T)));
+        return *reinterpret_cast<T*>(
+            static_cast<uint8_t*>(VMManager::instance().small_write_ptr(page_idx, offset)) + idx * sizeof(T));
     }
     /**
      * @brief Unchecked element access (read intent).
@@ -1905,7 +2120,8 @@ public:
      * @return Const reference.
      */
     const_reference operator[](size_type idx) const {
-        return *reinterpret_cast<const T*>(VMManager::instance().page_read_ptr(page_idx, idx * sizeof(T)));
+        return *reinterpret_cast<const T*>(
+            static_cast<const uint8_t*>(VMManager::instance().small_read_ptr(page_idx, offset)) + idx * sizeof(T));
     }
     /**
      * @brief Bounds-checked access.
@@ -1940,7 +2156,7 @@ public:
     }
 
     /**
-     * @brief Reset array elements to default constructed T() and swap out page.
+     * @brief Reset array elements to default constructed T() and flush page.
      */
     void clear() {
         for (size_type i = 0; i < N; ++i)
@@ -1964,7 +2180,8 @@ public:
     const_reverse_iterator crend()   const { return const_reverse_iterator(begin()); }
 
 private:
-    int page_idx; ///< Page index backing the array.
+    int page_idx;      ///< Page index in heap page.
+    size_t offset;     ///< Offset within the page.
 };
 
 // -----------------------------------------------------------------------------

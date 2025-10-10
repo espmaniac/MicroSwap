@@ -26,7 +26,8 @@
  * Limitations:
  *  - VMArray does not call constructors/destructors for non-trivial types.
  *  - VMVector cannot expose a contiguous data() buffer because elements span pages.
- *  - VMString uses a single page (no dynamic multi-page growth).
+ *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
+ *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
  *
  * Usage scenario:
  *  - Helps when RAM is scarce and some data can reside in a swap file when inactive.
@@ -67,6 +68,7 @@ struct VMPage {
     bool  can_free_ram;  ///< True if RAM can be released after swapping out.
     bool  dirty;         ///< True if RAM has unsaved modifications.
     bool  zero_filled;   ///< True if page content is known zero.
+    bool  is_heap;       ///< True if page is managed as a small-block heap page.
     uint8_t* ram_addr;   ///< Pointer to RAM buffer (if in_ram).
     size_t swap_offset;  ///< Offset in swap file where page content is stored.
     uint64_t last_access;///< Monotonic access counter (for potential eviction heuristics).
@@ -87,6 +89,8 @@ class VMString;
  *  - Allocating / freeing pages.
  *  - Swapping pages in/out from a filesystem file.
  *  - Tracking dirty state and providing read/write pointers.
+ *  - Providing a small-block heap allocator spread across dedicated "heap pages"
+ *    used by VMPtr<T> and VMString, so they no longer monopolize a whole page.
  *
  * Thread safety: Not thread-safe.
  */
@@ -152,6 +156,7 @@ public:
             pages[i].can_free_ram = true;
             pages[i].dirty        = false;
             pages[i].zero_filled  = true;
+            pages[i].is_heap      = false;
             pages[i].ram_addr     = nullptr;
             pages[i].swap_offset  = i * page_size;
             pages[i].last_access  = 0;
@@ -243,6 +248,296 @@ private:
     uint64_t access_tick;            ///< Global access counter.
     AllocOptions default_alloc_options; ///< Default allocation options.
 
+    // -------------------- Small-block heap (shared pages) --------------------
+    /**
+     * @brief Internal heap header stored at the start of a heap page.
+     */
+    struct HeapHeader {
+        uint32_t magic;       ///< Magic 'VMHP'.
+        uint16_t version;     ///< Format version (1).
+        uint16_t reserved;    ///< Reserved.
+        uint32_t first_free;  ///< Offset to first free block header (0 if none).
+        uint32_t total_free;  ///< Total free bytes in payload area (approximate).
+    };
+
+    /**
+     * @brief Internal block header stored before each allocated/free block.
+     *
+     * Layout keeps 8-byte alignment so payloads are naturally aligned.
+     */
+    struct BlockHeader {
+        uint32_t size;        ///< Payload size in bytes (rounded up to alignment).
+        uint32_t next_free;   ///< Offset to next free block header (0 if none); valid only when free.
+        uint16_t flags;       ///< Bit0 = 1 -> free, 0 -> used.
+        uint16_t reserved;    ///< Reserved/padding.
+    };
+
+    static constexpr uint32_t HEAP_MAGIC = 0x564D4850u; // 'VMHP'
+    static constexpr uint16_t HEAP_VERSION = 1;
+    static constexpr size_t   HEAP_ALIGN   = 8;         // 8-byte alignment for payloads
+    static constexpr size_t   HH_SIZE      = ((sizeof(HeapHeader) + (HEAP_ALIGN - 1)) & ~(HEAP_ALIGN - 1));
+    static constexpr size_t   BH_SIZE      = ((sizeof(BlockHeader) + (HEAP_ALIGN - 1)) & ~(HEAP_ALIGN - 1));
+
+    /**
+     * @brief Align up to HEAP_ALIGN.
+     */
+    static size_t align_up(size_t v) {
+        return (v + (HEAP_ALIGN - 1)) & ~(HEAP_ALIGN - 1);
+    }
+
+    /**
+     * @brief Check if page is a heap page (and initialize if needed).
+     * @param idx Page index.
+     * @return True if page has valid heap header.
+     */
+    bool ensure_heap_header(int idx) {
+        if (!valid_index(idx)) return false;
+        VMPage& pg = pages[idx];
+        if (!pg.allocated) return false;
+        if (!pg.in_ram || !pg.ram_addr) {
+            if (!swap_in(idx)) return false;
+        }
+        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+        if (pg.zero_filled || !pg.is_heap || hh->magic != HEAP_MAGIC || hh->version != HEAP_VERSION) {
+            // Initialize a new heap header and a single free block.
+            memset(pg.ram_addr, 0, page_size);
+            hh->magic = HEAP_MAGIC;
+            hh->version = HEAP_VERSION;
+            hh->reserved = 0;
+            size_t first_block_off = HH_SIZE;
+            size_t usable = (page_size > first_block_off + BH_SIZE) ? (page_size - first_block_off - BH_SIZE) : 0;
+            if (usable == 0) return false;
+            BlockHeader* bh = reinterpret_cast<BlockHeader*>(pg.ram_addr + first_block_off);
+            bh->size = (uint32_t)align_up(usable);
+            bh->next_free = 0;
+            bh->flags = 1; // free
+            bh->reserved = 0;
+            hh->first_free = (uint32_t)first_block_off;
+            hh->total_free = (uint32_t)bh->size;
+            pg.is_heap = true;
+            pg.zero_filled = false;
+            pg.dirty = true;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Allocate a new heap page (dedicated to small-block allocator).
+     * @param out_idx Output page index.
+     * @return True on success.
+     */
+    bool alloc_heap_page(int* out_idx) {
+        AllocOptions opts = default_alloc_options;
+        opts.zero_on_alloc = true;
+        opts.reuse_swap_data = false;
+        int idx = -1;
+        if (!alloc_page_ex(opts, &idx)) return false;
+        pages[idx].is_heap = true;
+        if (!ensure_heap_header(idx)) {
+            free_page(idx, true);
+            return false;
+        }
+        if (out_idx) *out_idx = idx;
+        return true;
+    }
+
+    /**
+     * @brief Try to allocate a payload block of at least 'size' from any heap page.
+     * @param size Requested payload size.
+     * @param align Alignment (ignored, we use HEAP_ALIGN globally).
+     * @param out_page Output page index.
+     * @param out_off Output payload offset in page.
+     * @param out_alloc_size Output actual payload size reserved (>= requested).
+     * @return True on success.
+     */
+    bool heap_alloc(size_t size, size_t /*align*/, int* out_page, size_t* out_off, size_t* out_alloc_size) {
+        const size_t need = align_up(size);
+        // 1) Search existing heap pages
+        for (size_t i = 0; i < page_count; ++i) {
+            VMPage& pg = pages[i];
+            if (!pg.allocated || !pg.is_heap) continue;
+            if (!ensure_heap_header((int)i)) continue;
+            HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+            // Quick filter
+            if (hh->total_free < need) continue;
+
+            uint32_t prev_off = 0;
+            uint32_t cur_off = hh->first_free;
+            while (cur_off) {
+                BlockHeader* cur = reinterpret_cast<BlockHeader*>(pg.ram_addr + cur_off);
+                if ((cur->flags & 1) && cur->size >= need) {
+                    // Found a block; split if large enough to hold another header + 1 byte
+                    const size_t remaining = (size_t)cur->size - need;
+                    if (remaining >= BH_SIZE + HEAP_ALIGN) {
+                        // Split: allocated part stays at cur_off, remainder becomes new free block after it
+                        const uint32_t alloc_off = cur_off;
+                        const uint32_t new_free_off = alloc_off + (uint32_t)BH_SIZE + (uint32_t)need;
+                        BlockHeader* new_free = reinterpret_cast<BlockHeader*>(pg.ram_addr + new_free_off);
+                        new_free->size = (uint32_t)align_up(remaining - BH_SIZE);
+                        new_free->flags = 1; // free
+                        new_free->reserved = 0;
+                        // insert new_free into free list in place of cur
+                        new_free->next_free = cur->next_free;
+
+                        // Mark current as used
+                        cur->size = (uint32_t)need;
+                        cur->flags = 0; // used
+                        cur->next_free = 0;
+
+                        // Update free list head/prev
+                        if (prev_off == 0) {
+                            hh->first_free = new_free_off;
+                        } else {
+                            BlockHeader* prev = reinterpret_cast<BlockHeader*>(pg.ram_addr + prev_off);
+                            prev->next_free = new_free_off;
+                        }
+                        // Update accounting
+                        hh->total_free -= (uint32_t)(need + BH_SIZE);
+                        pg.dirty = true;
+
+                        if (out_page) *out_page = (int)i;
+                        if (out_off) *out_off = alloc_off + BH_SIZE;
+                        if (out_alloc_size) *out_alloc_size = need;
+                        return true;
+                    } else {
+                        // Take the whole block without split
+                        // Remove from free list
+                        if (prev_off == 0) {
+                            hh->first_free = cur->next_free;
+                        } else {
+                            BlockHeader* prev = reinterpret_cast<BlockHeader*>(pg.ram_addr + prev_off);
+                            prev->next_free = cur->next_free;
+                        }
+                        // Mark used
+                        cur->flags = 0;
+                        uint32_t alloc_size = cur->size;
+                        cur->next_free = 0;
+
+                        // Accounting
+                        if (hh->total_free >= alloc_size)
+                            hh->total_free -= alloc_size;
+                        else
+                            hh->total_free = 0;
+                        pg.dirty = true;
+
+                        if (out_page) *out_page = (int)i;
+                        if (out_off) *out_off = cur_off + BH_SIZE;
+                        if (out_alloc_size) *out_alloc_size = alloc_size;
+                        return true;
+                    }
+                }
+                prev_off = cur_off;
+                cur_off = cur->next_free;
+            }
+        }
+
+        // 2) No fit found -> allocate a new heap page and retry there
+        int new_idx = -1;
+        if (!alloc_heap_page(&new_idx)) return false;
+        VMPage& pg = pages[new_idx];
+        if (!ensure_heap_header(new_idx)) return false;
+        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+        // Immediately allocate from the single free block
+        uint32_t prev_off = 0;
+        uint32_t cur_off = hh->first_free;
+        while (cur_off) {
+            BlockHeader* cur = reinterpret_cast<BlockHeader*>(pg.ram_addr + cur_off);
+            if ((cur->flags & 1) && cur->size >= need) {
+                // Same split/take logic as above
+                const size_t remaining = (size_t)cur->size - need;
+                if (remaining >= BH_SIZE + HEAP_ALIGN) {
+                    const uint32_t alloc_off = cur_off;
+                    const uint32_t new_free_off = alloc_off + (uint32_t)BH_SIZE + (uint32_t)need;
+                    BlockHeader* new_free = reinterpret_cast<BlockHeader*>(pg.ram_addr + new_free_off);
+                    new_free->size = (uint32_t)align_up(remaining - BH_SIZE);
+                    new_free->flags = 1;
+                    new_free->reserved = 0;
+                    new_free->next_free = cur->next_free;
+
+                    cur->size = (uint32_t)need;
+                    cur->flags = 0;
+                    cur->next_free = 0;
+
+                    if (prev_off == 0) {
+                        hh->first_free = new_free_off;
+                    } else {
+                        BlockHeader* prev = reinterpret_cast<BlockHeader*>(pg.ram_addr + prev_off);
+                        prev->next_free = new_free_off;
+                    }
+                    hh->total_free -= (uint32_t)(need + BH_SIZE);
+                    pg.dirty = true;
+
+                    if (out_page) *out_page = new_idx;
+                    if (out_off) *out_off = alloc_off + BH_SIZE;
+                    if (out_alloc_size) *out_alloc_size = need;
+                    return true;
+                } else {
+                    if (prev_off == 0) {
+                        hh->first_free = cur->next_free;
+                    } else {
+                        BlockHeader* prev = reinterpret_cast<BlockHeader*>(pg.ram_addr + prev_off);
+                        prev->next_free = cur->next_free;
+                    }
+                    cur->flags = 0;
+                    uint32_t alloc_size = cur->size;
+                    cur->next_free = 0;
+
+                    if (hh->total_free >= alloc_size)
+                        hh->total_free -= alloc_size;
+                    else
+                        hh->total_free = 0;
+                    pg.dirty = true;
+
+                    if (out_page) *out_page = new_idx;
+                    if (out_off) *out_off = cur_off + BH_SIZE;
+                    if (out_alloc_size) *out_alloc_size = alloc_size;
+                    return true;
+                }
+            }
+            prev_off = cur_off;
+            cur_off = cur->next_free;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Free a previously allocated small block by payload offset.
+     * @param page_idx Page index the block resides in.
+     * @param payload_off Offset to payload (not header).
+     */
+    void heap_free(int page_idx, size_t payload_off) {
+        if (!valid_index(page_idx)) return;
+        VMPage& pg = pages[page_idx];
+        if (!pg.allocated || !pg.is_heap) return;
+        if (!ensure_heap_header(page_idx)) return;
+        if (payload_off < BH_SIZE) return;
+        size_t hdr_off = payload_off - BH_SIZE;
+        if (hdr_off + BH_SIZE > page_size) return;
+
+        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+        BlockHeader* bh = reinterpret_cast<BlockHeader*>(pg.ram_addr + hdr_off);
+
+        // Basic sanity
+        if ((bh->flags & 1) == 0) {
+            // Mark as free and push to free list head (no coalescing to keep it simple)
+            bh->flags = 1;
+            bh->next_free = hh->first_free;
+            hh->first_free = (uint32_t)hdr_off;
+            hh->total_free += bh->size;
+            pg.dirty = true;
+        }
+    }
+
+    /**
+     * @brief Theoretical maximum payload size for a single small block within one page.
+     * @return Max payload bytes.
+     */
+    size_t heap_max_payload() const {
+        // one header and one block header overhead
+        if (page_size <= HH_SIZE + BH_SIZE) return 0;
+        return page_size - HH_SIZE - BH_SIZE;
+    }
+
     // -------------------- Private helpers (used by friends) --------------------
 
     /**
@@ -261,6 +556,7 @@ private:
                 pg.in_ram       = true;
                 pg.can_free_ram = opts.can_free_ram;
                 pg.last_access  = ++access_tick;
+                pg.is_heap      = false;
 
                 if (opts.reuse_swap_data) {
                     // Read existing content from swap through the read handle.
@@ -309,6 +605,7 @@ private:
         pg.in_ram       = true;
         pg.can_free_ram = opts.can_free_ram;
         pg.last_access  = ++access_tick;
+        pg.is_heap      = false;
 
         if (opts.reuse_swap_data) {
             swap_read.seek(pg.swap_offset);
@@ -492,6 +789,7 @@ private:
         page.allocated = false;
         page.dirty = false;
         page.zero_filled = true;
+        page.is_heap = false;
         page.last_access = ++access_tick;
         return true;
     }
@@ -555,8 +853,8 @@ private:
  * Supports pointer arithmetic (operator+, operator-, ++, --, etc.), indexing (operator[]), and comparisons.
  * 
  * Additional behavior:
- *  - Pages are auto-allocated on-demand. If the pointer has no page yet (page_idx == -1) or points to a
- *    not-yet-allocated page, the VMManager will allocate that page automatically on first access.
+ *  - Small-block allocation: on first use, storage is allocated from the manager's shared heap pages
+ *    (instead of dedicating a whole page). Multiple VMPtr objects share the same heap pages.
  *
  * @tparam T Object type pointed to.
  */
@@ -576,6 +874,7 @@ public:
      */
     bool valid() const {
         const auto& mgr = VMManager::instance();
+        if (page_idx_ == -1) return true; // lazy unallocated is valid
         return mgr.valid_index(page_idx_)
             && offset_ + sizeof(T) <= mgr.get_page_size();
     }
@@ -786,34 +1085,31 @@ protected:
 
 private:
     /**
-     * @brief Ensure the referenced page is ready: allocate if needed and load into RAM if not resident.
+     * @brief Ensure the referenced storage is ready: small-block allocate if needed and load into RAM if not resident.
      *
-     * @throws std::runtime_error If virtual position is out of range or allocation/swap-in fails.
+     * @throws std::runtime_error If allocation/swap-in fails.
      */
     void ensure_loaded() const {
         auto& mgr = VMManager::instance();
-        // Allocate a fresh page on first-time use.
+        // Allocate from shared heap on first-time use.
         if (page_idx_ == -1) {
             int new_idx = -1;
-            if (!mgr.alloc_page(&new_idx, true))
-                throw std::runtime_error("VMPtr: failed to allocate page");
+            size_t new_off = 0;
+            size_t alloc_sz = 0;
+            if (!mgr.heap_alloc(sizeof(T), alignof(T), &new_idx, &new_off, &alloc_sz))
+                throw std::runtime_error("VMPtr: failed to heap-allocate storage");
             page_idx_ = new_idx;
+            offset_   = new_off;
         } else {
             if (!mgr.valid_index(page_idx_))
                 throw std::runtime_error("VMPtr: page index out of range");
-        }
-
-        // Allocate specific target page if not yet allocated.
-        if (!mgr.pages[page_idx_].allocated) {
-            if (!mgr.alloc_page_at(page_idx_, mgr.default_alloc_options))
-                throw std::runtime_error("VMPtr: failed to allocate target page");
         }
 
         // Ensure the object fits entirely inside a single page.
         if (offset_ + sizeof(T) > mgr.get_page_size())
             throw std::runtime_error("VMPtr: object straddles page boundary");
 
-        // Load into RAM only if not resident; avoid clearing dirty on freshly allocated pages.
+        // Load into RAM only if not resident.
         if (!mgr.pages[page_idx_].in_ram || !mgr.pages[page_idx_].ram_addr) {
             if (!mgr.swap_in(page_idx_))
                 throw std::runtime_error("VMPtr: failed to swap-in page");
@@ -842,8 +1138,8 @@ private:
         return p;
     }
 
-    mutable int page_idx_;   ///< Index of page in VMManager (auto-allocated on demand).
-    size_t offset_;          ///< Offset inside the page (in bytes).
+    mutable int page_idx_;   ///< Index of page in VMManager (heap-allocated on demand).
+    mutable size_t offset_;  ///< Offset inside the page (in bytes) to payload.
 };
 
 // -----------------------------------------------------------------------------
@@ -1495,10 +1791,10 @@ private:
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Single-page mutable string with limited capacity (page_size - 1).
+ * @brief Single-page mutable string with limited capacity (allocated from shared heap pages).
  *
- * @details No multi-page growth; exceeding capacity throws. Provides many
- * std::string-like operations (append, insert, replace, find, etc.).
+ * @details No multi-page growth; exceeding theoretical single-block capacity throws.
+ * Now uses VMManager small-block heap so multiple strings/pointers share pages.
  */
 class VMString {
 public:
@@ -1516,12 +1812,12 @@ public:
     static constexpr size_type npos = static_cast<size_type>(-1); ///< Not-found value.
 
     /**
-     * @brief Construct with initial capacity (rounded to page capacity).
-     * @param initial_capacity Hint (still limited to one page).
+     * @brief Construct with initial capacity (allocated from heap pages).
+     * @param initial_capacity Hint (still limited to single heap-block capacity).
      */
     explicit VMString(size_t initial_capacity = 64)
-        : _page_idx(-1), _buf(nullptr), _size(0), _capacity(0) {
-        allocate_initial_page(initial_capacity);
+        : _page_idx(-1), _offset(0), _buf(nullptr), _size(0), _capacity(0) {
+        allocate_initial_block(initial_capacity);
         // Always refresh pointer through write path to ensure residency.
         char* b = write_buf();
         b[0] = '\0';
@@ -1538,9 +1834,10 @@ public:
 
     /// Move constructor.
     VMString(VMString&& other) noexcept
-        : _page_idx(other._page_idx), _buf(other._buf),
+        : _page_idx(other._page_idx), _offset(other._offset), _buf(other._buf),
           _size(other._size), _capacity(other._capacity) {
         other._page_idx = -1;
+        other._offset = 0;
         other._buf = nullptr;
         other._size = 0;
         other._capacity = 0;
@@ -1554,12 +1851,15 @@ public:
     /// Move assignment.
     VMString& operator=(VMString&& other) noexcept {
         if (this != &other) {
-            if (_page_idx >= 0) VMManager::instance().free_page(_page_idx);
+            // free current block
+            if (_page_idx >= 0) VMManager::instance().heap_free(_page_idx, _offset);
             _page_idx = other._page_idx;
+            _offset   = other._offset;
             _buf      = other._buf;
             _size     = other._size;
             _capacity = other._capacity;
             other._page_idx = -1;
+            other._offset = 0;
             other._buf = nullptr;
             other._size = 0;
             other._capacity = 0;
@@ -1567,12 +1867,13 @@ public:
         return *this;
     }
 
-    /// Destructor frees page.
+    /// Destructor frees heap block.
     ~VMString() {
         if (_page_idx >= 0) {
-            VMManager::instance().free_page(_page_idx);
+            VMManager::instance().heap_free(_page_idx, _offset);
             _buf = nullptr;
             _page_idx = -1;
+            _offset = 0;
         }
     }
 
@@ -1662,23 +1963,23 @@ public:
     size_type length() const { return _size; }
     size_type capacity() const { return _capacity; }
     /**
-     * @brief Maximum storable characters (excluding null terminator).
-     * @return Limit (page_size - 1).
+     * @brief Theoretical maximum storable characters in a single heap block (excluding null terminator).
+     * @return Limit (page_size - heap_header - block_header - 1).
      */
-    size_type max_size() const { return VMManager::instance().get_page_size() - 1; }
+    size_type max_size() const { return VMManager::instance().heap_max_payload() > 0 ? (VMManager::instance().heap_max_payload() - 1) : 0; }
 
     /**
      * @brief Ensure capacity >= new_cap.
      * @param new_cap Desired capacity.
-     * @throws std::length_error If exceeds single page.
+     * @throws std::length_error If exceeds single heap-block capacity.
      */
     void reserve(size_type new_cap) {
         if (new_cap <= _capacity) return;
-        if (new_cap > max_size()) throw std::length_error("VMString::reserve exceeds max_size()");
-        reallocate_page(new_cap);
+        if (new_cap > max_size()) throw std::length_error("VMString::reserve exceeds max single-block size");
+        reallocate_block(new_cap + 1);
     }
-    /// No-op (single page).
-    void shrink_to_fit() { /* no-op single page */ }
+    /// No-op (single block).
+    void shrink_to_fit() { /* no-op single block */ }
 
     /**
      * @brief Resize string (fill with ch if expanding).
@@ -1686,7 +1987,7 @@ public:
      * @param ch Fill character.
      */
     void resize(size_type new_size, char ch = '\0') {
-        if (new_size > max_size()) throw std::length_error("VMString::resize exceeds one page");
+        if (new_size > max_size()) throw std::length_error("VMString::resize exceeds one heap block");
         ensure_capacity(new_size + 1);
         char* buf = write_buf();
         if (new_size > _size)
@@ -1831,7 +2132,7 @@ public:
         char* buf = write_buf();
         if (s_count != rcount) {
             if (s_count > rcount) ensure_capacity(_size + (s_count - rcount) + 1);
-            // Refresh write buffer again in case capacity changed (page may be reallocated)
+            // Refresh write buffer again in case capacity changed
             buf = write_buf();
             memmove(buf + pos + s_count, buf + pos + rcount, _size - (pos + rcount));
             _size = _size - rcount + s_count;
@@ -1883,6 +2184,7 @@ public:
      */
     void swap(VMString& other) {
         std::swap(_page_idx, other._page_idx);
+        std::swap(_offset, other._offset);
         std::swap(_buf, other._buf);
         std::swap(_size, other._size);
         std::swap(_capacity, other._capacity);
@@ -2048,46 +2350,63 @@ public:
     }
 
 private:
-    int _page_idx;              ///< Page index for string storage.
+    int _page_idx;              ///< Page index for string storage (heap page).
+    size_t _offset;             ///< Payload offset within the page.
     mutable char* _buf;         ///< Cached character buffer; refreshed on each access to avoid dangling.
     size_type _size;            ///< Current string length.
     size_type _capacity;        ///< Usable character capacity (excl. null).
 
     /**
-     * @brief Allocate initial page and setup internal state.
-     * @param min_capacity Required capacity hint (within single page).
+     * @brief Allocate initial heap block and setup internal state.
+     * @param min_capacity Required capacity hint (within a single heap block).
      */
-    void allocate_initial_page(size_type /*min_capacity*/) {
+    void allocate_initial_block(size_type min_capacity) {
         int pidx;
-        VMManager::instance().alloc_page(&pidx, true);
+        size_t off = 0;
+        size_t alloc_sz = 0;
+        size_t need = (min_capacity + 1); // include null
+        if (need < 1) need = 1;
+        if (need > VMManager::instance().heap_max_payload())
+            need = VMManager::instance().heap_max_payload();
+        if (!VMManager::instance().heap_alloc(need, alignof(char), &pidx, &off, &alloc_sz))
+            throw std::runtime_error("VMString: heap_alloc failed");
         _page_idx = pidx;
-        // Initialize capacity; pointer will be obtained lazily on access.
-        _capacity = VMManager::instance().get_page_size() - 1;
+        _offset = off;
+        _capacity = alloc_sz > 0 ? (alloc_sz - 1) : 0; // reserve one byte for null
         _buf = nullptr; // will be acquired via write_buf/read_buf
+        _size = 0;
     }
 
     /**
-     * @brief Reallocate to a fresh page (still single page) and copy existing data.
-     * @param min_capacity Required capacity.
+     * @brief Reallocate to a fresh heap block and copy existing data.
+     * @param min_capacity Required capacity (excluding null).
      */
-    void reallocate_page(size_type min_capacity) {
-        if (min_capacity > max_size()) throw std::length_error("VMString::reallocate_page exceeds single page limit");
-        // Acquire read pointer to existing data before switching pages
-        const char* old_buf = (_page_idx >= 0) ? read_buf() : nullptr;
-
+    void reallocate_block(size_type min_capacity) {
         int new_page_idx;
-        VMManager::instance().alloc_page(&new_page_idx, true);
-        char* new_buf = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(new_page_idx, 0));
-        size_type new_capacity = VMManager::instance().get_page_size() - 1;
-        size_type copy_len = std::min(_size, new_capacity);
-        if (copy_len && old_buf) memcpy(new_buf, old_buf, copy_len);
+        size_t new_off = 0;
+        size_t new_alloc = 0;
+        size_t need = min_capacity; // includes null already when called
+        if (!VMManager::instance().heap_alloc(need, alignof(char), &new_page_idx, &new_off, &new_alloc))
+            throw std::length_error("VMString::reserve: cannot allocate requested capacity");
+        char* new_buf = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(new_page_idx, new_off));
+        size_type copy_len = std::min(_size, new_alloc > 0 ? (new_alloc - 1) : 0);
+        if (copy_len) {
+            const char* src = read_buf();
+            memcpy(new_buf, src, copy_len);
+        }
         _size = copy_len;
         new_buf[_size] = '\0';
-        if (_page_idx >= 0)
-            VMManager::instance().free_page(_page_idx);
+
+        // Free old block
+        if (_page_idx >= 0) {
+            VMManager::instance().heap_free(_page_idx, _offset);
+        }
+
+        // Update to new location
         _page_idx = new_page_idx;
-        _buf = new_buf; // update cache to the new resident buffer
-        _capacity = new_capacity;
+        _offset = new_off;
+        _buf = new_buf; // cache updated
+        _capacity = new_alloc > 0 ? (new_alloc - 1) : 0;
     }
 
     /**
@@ -2096,9 +2415,9 @@ private:
      */
     void ensure_capacity(size_type min_capacity) {
         if (min_capacity - 1 > max_size())
-            throw std::length_error("VMString exceeds single page capacity");
+            throw std::length_error("VMString exceeds single block capacity");
         if (min_capacity - 1 > _capacity)
-            reallocate_page(min_capacity - 1);
+            reallocate_block(min_capacity);
     }
 
     /**
@@ -2108,7 +2427,7 @@ private:
      */
     char* write_buf() const {
         if (_page_idx < 0) return const_cast<char*>(""); // moved-from; shouldn't happen for active strings
-        char* p = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(_page_idx, 0));
+        char* p = reinterpret_cast<char*>(VMManager::instance().get_write_ptr(_page_idx, _offset));
         if (!p) throw std::runtime_error("VMString: failed to acquire write buffer");
         _buf = p;
         return p;
@@ -2120,7 +2439,7 @@ private:
      */
     const char* read_buf() const {
         if (_page_idx < 0) return "";
-        char* p = reinterpret_cast<char*>(VMManager::instance().get_read_ptr(_page_idx, 0));
+        char* p = reinterpret_cast<char*>(VMManager::instance().get_read_ptr(_page_idx, _offset));
         if (!p) return "";
         _buf = p;
         return p;

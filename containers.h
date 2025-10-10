@@ -22,12 +22,18 @@
  *  - VMPtr<T> performs lazy allocation and swap-in, supports pointer arithmetic and indexing, and keeps write intent explicit.
  *  - Containers (vector / array / string) using pages as backing storage with iterators (including reverse iterators)
  *    and bounds-checked at().
+ *  - Small-block heap allocator enabling multiple small objects/arrays to share pages efficiently.
+ *
+ * Recent improvements:
+ *  - VMArray now uses small-heap blocks instead of dedicating entire pages, enabling better memory utilization.
+ *  - VMVector features hybrid mode: starts with flat contiguous storage (enabling data() access) and automatically
+ *    transitions to paged mode when size exceeds single-block capacity.
+ *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
+ *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
  *
  * Limitations:
  *  - VMArray does not call constructors/destructors for non-trivial types.
- *  - VMVector cannot expose a contiguous data() buffer because elements span pages.
- *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
- *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
+ *  - VMVector data() is only available in flat mode (small vectors); returns nullptr after transition to paged mode.
  *
  * Usage scenario:
  *  - Helps when RAM is scarce and some data can reside in a swap file when inactive.

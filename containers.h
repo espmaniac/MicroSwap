@@ -26,13 +26,14 @@
  *
  * Recent improvements:
  *  - VMArray now uses small-heap blocks instead of dedicating entire pages, enabling better memory utilization.
+ *  - VMArray automatically calls constructors/destructors for non-trivial types; zero-initializes trivial types.
  *  - VMVector features hybrid mode: starts with flat contiguous storage (enabling data() access) and automatically
  *    transitions to paged mode when size exceeds single-block capacity.
  *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
  *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
+ *  - VMPtr<T> has a destroy() method for explicit lifetime management.
  *
  * Limitations:
- *  - VMArray does not call constructors/destructors for non-trivial types.
  *  - VMVector data() is only available in flat mode (small vectors); returns nullptr after transition to paged mode.
  *
  * Usage scenario:
@@ -1126,6 +1127,56 @@ public:
     size_t page_offset() const { return offset_; }
 
     /**
+     * @brief Destroy the managed object and free its VM storage.
+     *
+     * @details
+     * For non-trivial types (types with user-defined destructors), this method explicitly
+     * calls the destructor on the managed object before freeing the VM storage.
+     * For trivial types, only the storage is freed without calling a destructor.
+     * 
+     * After calling destroy(), the VMPtr becomes null (page_idx_ = -1) and should not be
+     * dereferenced or used to access the object. Calling destroy() on a null VMPtr is safe
+     * and does nothing.
+     * 
+     * This method provides explicit lifetime management for objects stored in virtual memory,
+     * similar to std::unique_ptr::reset() or manual delete.
+     * 
+     * @note This method does not automatically get called when VMPtr goes out of scope.
+     *       Users must explicitly call destroy() when they want to end the object's lifetime.
+     * 
+     * Example usage:
+     * @code
+     * auto ptr = make_vm<MyClass>(arg1, arg2);
+     * ptr->method();  // Use the object
+     * ptr.destroy();  // Explicitly destroy and free
+     * // ptr is now null and should not be used
+     * @endcode
+     */
+    void destroy() {
+        if (page_idx_ < 0) return; // Already null, nothing to do
+        
+        // For non-trivial types, explicitly call destructor
+        if (!std::is_trivially_destructible<T>::value) {
+            try {
+                // Ensure loaded so we can call destructor
+                ensure_loaded();
+                T* obj = ptr_write();
+                obj->~T();
+            } catch (...) {
+                // If ensure_loaded or ptr_write fails, we still need to free storage
+                // Continue to free even if destructor call failed
+            }
+        }
+        
+        // Free the VM storage
+        VMManager::instance().small_free(page_idx_, offset_);
+        
+        // Mark as null
+        page_idx_ = -1;
+        offset_ = 0;
+    }
+
+    /**
      * @brief Equality comparison.
      * @param other Another VMPtr.
      * @return True if points to same page and offset.
@@ -2143,8 +2194,16 @@ private:
  * @brief Fixed-size array backed by a small-heap block.
  * @tparam T Element type.
  * @tparam N Number of elements.
- * @warning Does not invoke constructors/destructors for non-trivial types.
- * @details Now uses VMManager small-block heap so multiple arrays can share pages efficiently.
+ * @details 
+ * Now uses VMManager small-block heap so multiple arrays can share pages efficiently.
+ * 
+ * Object lifetime management:
+ *  - For trivial types (int, POD structs, etc.): memory is zero-initialized, no constructors/destructors called
+ *  - For non-trivial types: all elements are default-constructed using placement new in the constructor,
+ *    and destructors are called for all elements in the destructor
+ * 
+ * This ensures VMArray behaves like std::array regarding object lifetime for non-trivial types,
+ * while maintaining efficiency for trivial types.
  */
 template<typename T, size_t N>
 class VMArray {
@@ -2167,15 +2226,48 @@ public:
         if (!VMManager::instance().small_alloc(needed, alignof(T), page_idx, offset, alloc_sz)) {
             throw std::runtime_error("VMArray: small_alloc failed");
         }
-        // Zero-initialize the allocated block
+        
         void* ptr = VMManager::instance().small_write_ptr(page_idx, offset);
-        if (ptr) {
+        if (!ptr) {
+            VMManager::instance().small_free(page_idx, offset);
+            throw std::runtime_error("VMArray: failed to acquire write pointer");
+        }
+        
+        // For trivial types, just zero-initialize the memory
+        if (std::is_trivially_default_constructible<T>::value) {
             memset(ptr, 0, alloc_sz);
+        } else {
+            // For non-trivial types, use placement new to construct each element
+            T* arr = reinterpret_cast<T*>(ptr);
+            size_t constructed = 0;
+            try {
+                for (size_t i = 0; i < N; ++i) {
+                    new(&arr[i]) T();
+                    constructed++;
+                }
+            } catch (...) {
+                // If construction fails, destroy already constructed elements
+                for (size_t i = 0; i < constructed; ++i) {
+                    arr[i].~T();
+                }
+                VMManager::instance().small_free(page_idx, offset);
+                throw;
+            }
         }
     }
     /// Destructor frees heap block.
     ~VMArray() {
         if (page_idx >= 0) {
+            // For non-trivial types, explicitly call destructors
+            if (!std::is_trivially_destructible<T>::value) {
+                void* ptr = VMManager::instance().small_write_ptr(page_idx, offset);
+                if (ptr) {
+                    T* arr = reinterpret_cast<T*>(ptr);
+                    for (size_t i = 0; i < N; ++i) {
+                        arr[i].~T();
+                    }
+                }
+            }
             VMManager::instance().small_free(page_idx, offset);
             page_idx = -1;
         }

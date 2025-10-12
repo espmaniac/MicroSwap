@@ -1348,10 +1348,6 @@ private:
  *
  * Example usage:
  * @code
- * // Instead of manually managing allocation:
- * // VMPtr<MyClass> ptr;
- * // *ptr = MyClass(arg1, arg2);  // requires default constructor + assignment
- * 
  * // Use make_vm for direct construction:
  * auto ptr = make_vm<MyClass>(arg1, arg2, arg3);
  * ptr->method();
@@ -1392,8 +1388,6 @@ VMPtr<T> make_vm(Args&&... args) {
         throw;
     }
     
-    // Return VMPtr using protected constructor
-    // We need to make make_vm a friend of VMPtr to access the protected constructor
     return VMPtr<T>(page_idx, offset);
 }
 

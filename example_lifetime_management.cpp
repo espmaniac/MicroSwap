@@ -8,8 +8,11 @@
 
 // This example would be used in an Arduino environment
 // For demonstration purposes, we show the key concepts
+// Note: In actual Arduino code, you would also need:
+// #include <SPIFFS.h> or #include <LittleFS.h>
+// depending on your filesystem choice
 
-#include "containers.h"
+#include "containers.h"  // Assumes containers.h is in your include path
 
 // Example 1: Non-trivial class with constructor/destructor
 class Sensor {
@@ -62,6 +65,7 @@ void setup() {
     Serial.begin(115200);
     
     // Initialize VMManager with filesystem
+    // Note: SPIFFS must be included and initialized in actual Arduino code
     if (!VMManager::instance().begin(SPIFFS, "/swap.dat")) {
         Serial.println("Failed to initialize VMManager");
         return;
@@ -104,6 +108,8 @@ void setup() {
         Serial.println(readings[0].timestamp);
         
         // Fill with data
+        // Note: Using A0 for all readings for simplicity - in real code, you'd
+        // typically read from different sensors or at different times
         for (size_t i = 0; i < 10; i++) {
             readings[i].value = analogRead(A0);
             readings[i].timestamp = millis();

@@ -1341,11 +1341,29 @@ private:
  * The object is allocated from VMManager's shared heap pages and constructed using
  * placement new with perfect forwarding of arguments.
  *
+ * Benefits over manual construction:
+ *  - Exception-safe: automatically frees allocated memory if constructor throws
+ *  - Cleaner syntax: no need to manually handle allocation/construction steps
+ *  - Type-safe: uses perfect forwarding for constructor arguments
+ *
  * Example usage:
  * @code
+ * // Instead of manually managing allocation:
+ * // VMPtr<MyClass> ptr;
+ * // *ptr = MyClass(arg1, arg2);  // requires default constructor + assignment
+ * 
+ * // Use make_vm for direct construction:
  * auto ptr = make_vm<MyClass>(arg1, arg2, arg3);
  * ptr->method();
+ * 
+ * // Works with any constructor:
+ * auto defaultPtr = make_vm<MyClass>();              // Default constructor
+ * auto singleArg = make_vm<MyClass>(42);             // Single argument
+ * auto multiArg = make_vm<MyClass>(1, "test", 3.14); // Multiple arguments
  * @endcode
+ *
+ * @note The returned VMPtr does not automatically call the destructor when it goes out of scope.
+ *       This is consistent with VMPtr's design where users manage object lifetime explicitly.
  */
 template<typename T, typename... Args>
 VMPtr<T> make_vm(Args&&... args) {

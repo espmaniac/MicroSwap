@@ -241,6 +241,10 @@ private:
     template<typename T> friend class ::VMVector;
     template<typename T, size_t N> friend class ::VMArray;
     friend class ::VMString;
+    
+    // Friend declaration for make_vm helper function
+    template<typename T, typename... Args>
+    friend VMPtr<T> make_vm(Args&&... args);
 
     // -------------------- Private state (hidden from end users) --------------------
     VMPage pages[VM_PAGE_COUNT]; ///< Page table.
@@ -1256,6 +1260,10 @@ protected:
      */
     VMPtr(int page, size_t offset) : page_idx_(page), offset_(offset) {}
 
+    // Friend declaration for make_vm helper function
+    template<typename U, typename... Args>
+    friend VMPtr<U> make_vm(Args&&... args);
+
 private:
     /**
      * @brief Ensure the referenced storage is ready: small-block allocate if needed and load into RAM if not resident.
@@ -1314,6 +1322,62 @@ private:
     mutable int page_idx_;   ///< Index of page in VMManager (heap-allocated on demand).
     mutable size_t offset_;  ///< Offset inside the page (in bytes) to payload.
 };
+
+// -----------------------------------------------------------------------------
+// VMPtr helper functions
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Factory function to create and construct a VMPtr-managed object.
+ * @tparam T Object type.
+ * @tparam Args Constructor argument types.
+ * @param args Constructor arguments.
+ * @return VMPtr<T> pointing to newly constructed object.
+ * @throws std::runtime_error If allocation or construction fails.
+ *
+ * @details
+ * Creates a VMPtr<T> and constructs the object in-place using the provided arguments.
+ * This provides a safer, smart-pointer-like workflow similar to std::make_unique.
+ * The object is allocated from VMManager's shared heap pages and constructed using
+ * placement new with perfect forwarding of arguments.
+ *
+ * Example usage:
+ * @code
+ * auto ptr = make_vm<MyClass>(arg1, arg2, arg3);
+ * ptr->method();
+ * @endcode
+ */
+template<typename T, typename... Args>
+VMPtr<T> make_vm(Args&&... args) {
+    auto& mgr = VMManager::instance();
+    
+    // Allocate storage from small heap
+    int page_idx = -1;
+    size_t offset = 0;
+    size_t alloc_sz = 0;
+    if (!mgr.small_alloc(sizeof(T), alignof(T), page_idx, offset, alloc_sz)) {
+        throw std::runtime_error("make_vm: failed to allocate storage");
+    }
+    
+    // Get writable pointer to the allocated space
+    void* ptr = mgr.small_write_ptr(page_idx, offset);
+    if (!ptr) {
+        mgr.small_free(page_idx, offset);
+        throw std::runtime_error("make_vm: failed to acquire write pointer");
+    }
+    
+    // Construct object in-place using placement new with perfect forwarding
+    try {
+        new(ptr) T(std::forward<Args>(args)...);
+    } catch (...) {
+        mgr.small_free(page_idx, offset);
+        throw;
+    }
+    
+    // Return VMPtr using protected constructor
+    // We need to make make_vm a friend of VMPtr to access the protected constructor
+    return VMPtr<T>(page_idx, offset);
+}
 
 // -----------------------------------------------------------------------------
 // detail namespace: iterator implementations

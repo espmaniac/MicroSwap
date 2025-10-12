@@ -12,6 +12,7 @@
  *  - VMPtr<T>: a smart pointer to objects stored inside a virtual memory page with pointer arithmetic, indexing, and
  *    transparent swap-in on access. Its internal constructor (page, offset) is protected to prevent unsafe user creation;
  *    users should rely on default construction and let pages be allocated lazily on first access.
+ *  - VMPtrReadGuard<T> and VMPtrWriteGuard<T>: RAII helpers for safe, scoped pointer access to VMPtr-managed objects.
  *
  * Core features:
  *  - Fixed number of pages (compile-time constants VM_PAGE_SIZE / VM_PAGE_COUNT).
@@ -20,6 +21,7 @@
  *  - Separation of read vs write access: get_read_ptr() does not mark dirty,
  *    while get_write_ptr() (and legacy get_ptr()) marks dirty.
  *  - VMPtr<T> performs lazy allocation and swap-in, supports pointer arithmetic and indexing, and keeps write intent explicit.
+ *  - RAII guard classes (VMPtrReadGuard/VMPtrWriteGuard) provide safe scoped access with automatic lifetime management.
  *  - Containers (vector / array / string) using pages as backing storage with iterators (including reverse iterators)
  *    and bounds-checked at().
  *  - Small-block heap allocator enabling multiple small objects/arrays to share pages efficiently.
@@ -30,6 +32,7 @@
  *    transitions to paged mode when size exceeds single-block capacity.
  *  - VMString uses a single page (no dynamic multi-page growth), but now allocates from a shared heap page instead of owning an entire page.
  *  - VMPtr<T> now allocates its object storage from shared heap pages instead of dedicating a whole page.
+ *  - VMPtr<T> now provides read() and write() methods that return RAII guard objects for safer pointer access.
  *
  * Limitations:
  *  - VMArray does not call constructors/destructors for non-trivial types.
@@ -41,6 +44,7 @@
  * Safety:
  *  - VMPtr's (page, offset) constructor is protected to avoid unsafe manual pointer creation by end users.
  *  - VMManager internals are private; only friend types (VMPtr/containers) can touch low-level paging.
+ *  - RAII guard classes ensure safe pointer access with automatic resource management.
  *
  * Thread safety:
  *  - Not thread-safe.
@@ -82,6 +86,8 @@ struct VMPage {
 
 // Forward declarations for friend declarations
 template<typename T> class VMPtr;
+template<typename T> class VMPtrReadGuard;
+template<typename T> class VMPtrWriteGuard;
 template<typename T> class VMVector;
 template<typename T, size_t N> class VMArray;
 class VMString;
@@ -1110,6 +1116,48 @@ public:
     }
 
     /**
+     * @brief Create RAII guard for read-only access.
+     * @return VMPtrReadGuard<T> that holds a read-only pointer for its lifetime.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
+     * 
+     * @details
+     * Returns an RAII guard object that manages the lifetime of the read pointer.
+     * The guard ensures the page remains loaded and provides convenient access
+     * via operator* and operator-> without marking the page dirty.
+     * 
+     * Usage:
+     * @code
+     *   VMPtr<MyStruct> ptr;
+     *   auto guard = ptr.read();
+     *   int val = guard->field;  // Read access
+     * @endcode
+     */
+    VMPtrReadGuard<T> read() const {
+        return VMPtrReadGuard<T>(*this);
+    }
+
+    /**
+     * @brief Create RAII guard for write access.
+     * @return VMPtrWriteGuard<T> that holds a writable pointer for its lifetime.
+     * @throws std::runtime_error if invalid or on swap/ptr acquisition failure.
+     * 
+     * @details
+     * Returns an RAII guard object that manages the lifetime of the write pointer.
+     * The guard ensures the page remains loaded, marks it as dirty, and provides
+     * convenient access via operator* and operator-> for modifications.
+     * 
+     * Usage:
+     * @code
+     *   VMPtr<MyStruct> ptr;
+     *   auto guard = ptr.write();
+     *   guard->field = 42;  // Write access
+     * @endcode
+     */
+    VMPtrWriteGuard<T> write() {
+        return VMPtrWriteGuard<T>(*this);
+    }
+
+    /**
      * @brief Get page index.
      * @return Page index.
      */
@@ -1313,6 +1361,211 @@ private:
 
     mutable int page_idx_;   ///< Index of page in VMManager (heap-allocated on demand).
     mutable size_t offset_;  ///< Offset inside the page (in bytes) to payload.
+
+    // Forward declare guard classes for friend declarations
+    template<typename U> friend class VMPtrReadGuard;
+    template<typename U> friend class VMPtrWriteGuard;
+};
+
+// -----------------------------------------------------------------------------
+// VMPtr RAII Lifecycle Helpers
+// -----------------------------------------------------------------------------
+
+/**
+ * @class VMPtrReadGuard
+ * @brief RAII guard for read-only access to VMPtr-managed object.
+ * 
+ * @details
+ * Provides safe, scoped read-only access to an object managed by VMPtr.
+ * On construction, ensures the page is loaded and acquires a read pointer.
+ * The pointer remains valid for the lifetime of the guard object.
+ * 
+ * Key features:
+ *  - Automatic pointer acquisition and validation
+ *  - Prevents page from being swapped out while guard is alive
+ *  - Does not mark page as dirty (read-only access)
+ *  - Move-only semantics (no copy)
+ *  - Convenient operator* and operator-> access
+ * 
+ * Usage example:
+ * @code
+ *   VMPtr<MyStruct> ptr;
+ *   {
+ *     auto guard = ptr.read();
+ *     int val = guard->field;  // Safe access
+ *   } // guard destroyed, pointer released
+ * @endcode
+ * 
+ * @tparam T Type of object being guarded.
+ */
+template<typename T>
+class VMPtrReadGuard {
+public:
+    /**
+     * @brief Construct guard from VMPtr (acquires read pointer).
+     * @param vmptr Reference to VMPtr to guard.
+     * @throws std::runtime_error If pointer acquisition fails.
+     */
+    explicit VMPtrReadGuard(const VMPtr<T>& vmptr) : ptr_(nullptr) {
+        vmptr.ensure_loaded();
+        ptr_ = vmptr.ptr_read();
+    }
+
+    /// Destructor (pointer is released automatically).
+    ~VMPtrReadGuard() = default;
+
+    /// Deleted copy constructor (move-only).
+    VMPtrReadGuard(const VMPtrReadGuard&) = delete;
+    /// Deleted copy assignment (move-only).
+    VMPtrReadGuard& operator=(const VMPtrReadGuard&) = delete;
+
+    /// Move constructor.
+    VMPtrReadGuard(VMPtrReadGuard&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+    }
+
+    /// Move assignment.
+    VMPtrReadGuard& operator=(VMPtrReadGuard&& other) noexcept {
+        if (this != &other) {
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Dereference operator (read-only).
+     * @return Const reference to guarded object.
+     */
+    const T& operator*() const {
+        return *ptr_;
+    }
+
+    /**
+     * @brief Member access operator (read-only).
+     * @return Const pointer to guarded object.
+     */
+    const T* operator->() const {
+        return ptr_;
+    }
+
+    /**
+     * @brief Get raw const pointer.
+     * @return Const pointer to guarded object.
+     */
+    const T* get() const {
+        return ptr_;
+    }
+
+    /**
+     * @brief Check if guard holds a valid pointer.
+     * @return True if pointer is non-null.
+     */
+    explicit operator bool() const {
+        return ptr_ != nullptr;
+    }
+
+private:
+    const T* ptr_;  ///< Cached read-only pointer.
+};
+
+/**
+ * @class VMPtrWriteGuard
+ * @brief RAII guard for write access to VMPtr-managed object.
+ * 
+ * @details
+ * Provides safe, scoped write access to an object managed by VMPtr.
+ * On construction, ensures the page is loaded and acquires a write pointer.
+ * The pointer remains valid for the lifetime of the guard object.
+ * Marks the page as dirty to ensure modifications are persisted.
+ * 
+ * Key features:
+ *  - Automatic pointer acquisition and validation
+ *  - Prevents page from being swapped out while guard is alive
+ *  - Marks page as dirty (write access)
+ *  - Move-only semantics (no copy)
+ *  - Convenient operator* and operator-> access
+ * 
+ * Usage example:
+ * @code
+ *   VMPtr<MyStruct> ptr;
+ *   {
+ *     auto guard = ptr.write();
+ *     guard->field = 42;  // Safe write access
+ *   } // guard destroyed, pointer released, page marked dirty
+ * @endcode
+ * 
+ * @tparam T Type of object being guarded.
+ */
+template<typename T>
+class VMPtrWriteGuard {
+public:
+    /**
+     * @brief Construct guard from VMPtr (acquires write pointer).
+     * @param vmptr Reference to VMPtr to guard.
+     * @throws std::runtime_error If pointer acquisition fails.
+     */
+    explicit VMPtrWriteGuard(VMPtr<T>& vmptr) : ptr_(nullptr) {
+        vmptr.ensure_loaded();
+        ptr_ = vmptr.ptr_write();
+    }
+
+    /// Destructor (pointer is released automatically).
+    ~VMPtrWriteGuard() = default;
+
+    /// Deleted copy constructor (move-only).
+    VMPtrWriteGuard(const VMPtrWriteGuard&) = delete;
+    /// Deleted copy assignment (move-only).
+    VMPtrWriteGuard& operator=(const VMPtrWriteGuard&) = delete;
+
+    /// Move constructor.
+    VMPtrWriteGuard(VMPtrWriteGuard&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+    }
+
+    /// Move assignment.
+    VMPtrWriteGuard& operator=(VMPtrWriteGuard&& other) noexcept {
+        if (this != &other) {
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Dereference operator (write access).
+     * @return Reference to guarded object.
+     */
+    T& operator*() const {
+        return *ptr_;
+    }
+
+    /**
+     * @brief Member access operator (write access).
+     * @return Pointer to guarded object.
+     */
+    T* operator->() const {
+        return ptr_;
+    }
+
+    /**
+     * @brief Get raw pointer.
+     * @return Pointer to guarded object.
+     */
+    T* get() const {
+        return ptr_;
+    }
+
+    /**
+     * @brief Check if guard holds a valid pointer.
+     * @return True if pointer is non-null.
+     */
+    explicit operator bool() const {
+        return ptr_ != nullptr;
+    }
+
+private:
+    T* ptr_;  ///< Cached writable pointer.
 };
 
 // -----------------------------------------------------------------------------

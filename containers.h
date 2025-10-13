@@ -577,7 +577,7 @@ private:
             }
         }
         if (victim < 0) return false;
-        // swap_out() flushes dirty pages and frees RAM. Returns true on success.
+        // swap_out() flushes dirty pages and frees RAM if can_free_ram is true. Returns true on success.
         return swap_out(victim, false);
     }
 

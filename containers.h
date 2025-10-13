@@ -552,6 +552,52 @@ private:
     // -------------------- Private helpers (used by friends) --------------------
 
     /**
+     * @brief Evict one RAM-resident page using an LRU policy.
+     * @return True if a page was evicted (RAM freed), false otherwise.
+     *
+     * @details
+     * Chooses among pages that are allocated, currently resident in RAM (in_ram && ram_addr),
+     * and permitted to free RAM (can_free_ram). The victim is the page with the smallest
+     * last_access value (least recently used). Dirty pages are flushed via swap_out().
+     */
+    bool evict_one_page() {
+        int victim = -1;
+        uint64_t best = std::numeric_limits<uint64_t>::max();
+
+        for (int i = 0; i < (int)page_count; ++i) {
+            VMPage& pg = pages[i];
+            if (!pg.allocated) continue;
+            if (!pg.in_ram || !pg.ram_addr) continue;
+            if (!pg.can_free_ram) continue;
+            // Pick the least recently accessed page
+            if (pg.last_access < best) {
+                best = pg.last_access;
+                victim = i;
+            }
+        }
+        if (victim < 0) return false;
+        // swap_out() will flush dirty pages if needed and free RAM when allowed
+        return swap_out(victim, false);
+    }
+
+    /**
+     * @brief Allocate a page-sized RAM buffer; if malloc fails, evict pages until it succeeds.
+     * @return Pointer to allocated buffer, or nullptr if eviction did not free enough RAM.
+     *
+     * @details
+     * Repeatedly tries malloc(page_size). On failure, evicts one LRU page and retries.
+     * Attempts are bounded by page_count to avoid unbounded loops.
+     */
+    uint8_t* alloc_ram_buffer_with_eviction() {
+        for (size_t attempt = 0; attempt <= page_count; ++attempt) {
+            uint8_t* p = static_cast<uint8_t*>(malloc(page_size));
+            if (p) return p;
+            if (!evict_one_page()) break;
+        }
+        return nullptr;
+    }
+
+    /**
      * @brief Allocate a page with extended options (first free slot).
      * @param opts Allocation options.
      * @param out_idx Optional output page index.
@@ -561,7 +607,8 @@ private:
         for (size_t i = 0; i < page_count; i++) {
             VMPage& pg = pages[i];
             if (!pg.allocated) {
-                pg.ram_addr = (uint8_t*)malloc(page_size);
+                // Allocate RAM buffer with eviction fallback
+                pg.ram_addr = alloc_ram_buffer_with_eviction();
                 if (!pg.ram_addr) return nullptr;
                 pg.allocated    = true;
                 pg.in_ram       = true;
@@ -610,7 +657,8 @@ private:
             }
             return pg.ram_addr;
         }
-        pg.ram_addr = (uint8_t*)malloc(page_size);
+        // Allocate RAM buffer with eviction fallback
+        pg.ram_addr = alloc_ram_buffer_with_eviction();
         if (!pg.ram_addr) return nullptr;
         pg.allocated    = true;
         pg.in_ram       = true;
@@ -684,7 +732,8 @@ private:
         VMPage& page = pages[idx];
         if (!page.allocated) return false;
         if (!page.in_ram || !page.ram_addr) {
-            page.ram_addr = (uint8_t*)malloc(page_size);
+            // Allocate RAM buffer with eviction fallback
+            page.ram_addr = alloc_ram_buffer_with_eviction();
             if (!page.ram_addr) return false;
             page.in_ram = true;
         }

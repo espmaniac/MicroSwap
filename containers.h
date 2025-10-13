@@ -559,6 +559,7 @@ private:
      * Chooses among pages that are allocated, currently resident in RAM (in_ram && ram_addr),
      * and permitted to free RAM (can_free_ram). The victim is the page with the smallest
      * last_access value (least recently used). Dirty pages are flushed via swap_out().
+     * Returns false if no eligible page exists for eviction.
      */
     bool evict_one_page() {
         int victim = -1;
@@ -576,7 +577,7 @@ private:
             }
         }
         if (victim < 0) return false;
-        // swap_out() will flush dirty pages if needed and free RAM when allowed
+        // swap_out() flushes dirty pages and frees RAM. Returns true on success.
         return swap_out(victim, false);
     }
 
@@ -586,10 +587,11 @@ private:
      *
      * @details
      * Repeatedly tries malloc(page_size). On failure, evicts one LRU page and retries.
-     * Attempts are bounded by page_count to avoid unbounded loops.
+     * Attempts are bounded by page_count to avoid unbounded loops. If evict_one_page()
+     * returns false (no eligible page to evict), the loop terminates early.
      */
     uint8_t* alloc_ram_buffer_with_eviction() {
-        for (size_t attempt = 0; attempt <= page_count; ++attempt) {
+        for (size_t attempt = 0; attempt < page_count; ++attempt) {
             uint8_t* p = static_cast<uint8_t*>(malloc(page_size));
             if (p) return p;
             if (!evict_one_page()) break;

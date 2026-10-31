@@ -1,12 +1,13 @@
 // MicroSwap basic example: a vector bigger than the RAM it uses.
 //
-// The swap file lives on an SD card (LittleFS on ESP8266 / RP2040).
+// The swap file lives on an SD card. Avoid the board's internal flash
+// (LittleFS, SPIFFS): swapping rewrites it constantly and wears it out.
 // Wiring: SD card on the board's default SPI pins, chip select on SD_CS_PIN.
 
 #include <MicroSwap.h>
 
 #if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
-#include <LittleFS.h>
+#include <SDFS.h>
 #else
 #include <SPI.h>
 #include <SD.h>
@@ -21,8 +22,9 @@ VMFileStorage<File> swapStorage(swapFile);
 /// Mount the file system and open the swap file for reading and writing.
 bool openSwapFile() {
 #if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
-    if (!LittleFS.begin()) return false;
-    swapFile = LittleFS.open(SWAP_PATH, "w+");
+    SDFS.setConfig(SDFSConfig(SD_CS_PIN));
+    if (!SDFS.begin()) return false;
+    swapFile = SDFS.open(SWAP_PATH, "w+");
 #elif defined(ESP32)
     if (!SD.begin(SD_CS_PIN)) return false;
     swapFile = SD.open(SWAP_PATH, "w+");

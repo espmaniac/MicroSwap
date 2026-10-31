@@ -8,7 +8,7 @@
 #include "Person.h"
 
 #if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
-#include <LittleFS.h>
+#include <SDFS.h>
 #else
 #include <SPI.h>
 #include <SD.h>
@@ -27,8 +27,9 @@ VMFileStorage<File> swapStorage(swapFile);
 
 bool openSwapFile() {
 #if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
-    if (!LittleFS.begin()) return false;
-    swapFile = LittleFS.open(SWAP_PATH, "w+");
+    SDFS.setConfig(SDFSConfig(SD_CS_PIN));
+    if (!SDFS.begin()) return false;
+    swapFile = SDFS.open(SWAP_PATH, "w+");
 #elif defined(ESP32)
     if (!SD.begin(SD_CS_PIN)) return false;
     swapFile = SD.open(SWAP_PATH, "w+");

@@ -62,12 +62,14 @@ The file must be opened for both reading and writing and must stay open:
 
 | Library | Open with |
 |---|---|
-| ESP32 `SD`, `LittleFS`, `SPIFFS` | `SD.open(path, "w+")` |
-| ESP8266 / RP2040 `LittleFS` | `LittleFS.open(path, "w+")` |
+| ESP32 `SD` | `SD.open(path, "w+")` |
+| ESP8266 / RP2040 `SDFS` | `SDFS.open(path, "w+")` |
 | Arduino `SD` (AVR, SAMD, STM32, ...) | `SD.open(path, O_READ \| O_WRITE \| O_CREAT)` |
 | SdFat | `sd.open(path, O_RDWR \| O_CREAT \| O_TRUNC)` |
 
 Do not use `FILE_WRITE` with the Arduino `SD` library: it appends every write to the end of the file.
+
+Prefer an SD card over the board's internal flash (`LittleFS`, `SPIFFS`). Swapping rewrites the same pages over and over, and internal flash wears out after a limited number of writes. If you must use it, raise `VM_RESIDENT_PAGES` to swap less.
 
 To store pages somewhere else (external SPI RAM, FRAM, ...), implement `VMStorage`:
 
@@ -92,6 +94,8 @@ Define these as build flags, or with `#define` before `#include <MicroSwap.h>` i
 
 RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
 
+A page is written back only if it changed. Pages read through non-const references (`v[i]` on a non-const vector, iterators passed to algorithms) are compared with their stored copy before eviction and are not rewritten when nothing changed.
+
 ## Errors
 
 Errors (out of pages, storage failure, index out of range, ...) are passed to an error handler. The default handler calls `abort()`. Set your own to log and reset, or to return:
@@ -109,7 +113,7 @@ If the handler returns, the failed operation does nothing; for example, `push_ba
 
 ## Rules to follow
 
-**Use references right away.** `v[i]`, `*ptr`, `s.c_str()` and iterators' `*it` return references into a page in RAM. If other pages are loaded afterwards, that page may be swapped out and the reference then points to other data. At least `VM_RESIDENT_PAGES - 1` other pages can be touched safely, which is enough for the containers' own operations and for `std::sort` and similar algorithms. Do not keep a reference while doing a lot of other work:
+**Use references right away.** `v[i]`, `*ptr`, `s.c_str()` and iterators' `*it` return references into a page in RAM. If other pages are loaded afterwards, that page may be swapped out and the reference then points to other data. At least `VM_RESIDENT_PAGES - 1` other pages can be touched safely. That is enough for the containers' own operations. `std::sort` over vectors of numbers and of objects with `VMString` members is covered by the tests, but other algorithms, or comparators that touch many objects at once, can exceed the limit; raise `VM_RESIDENT_PAGES` if in doubt. Do not keep a reference while doing a lot of other work:
 
 ```cpp
 long& first = v[0];
@@ -158,6 +162,7 @@ public:
     virtual ~VMStorage();
     virtual bool read(uint32_t offset, uint8_t* buf, size_t len) = 0;
     virtual bool write(uint32_t offset, const uint8_t* buf, size_t len) = 0;
+    virtual bool flush();   // called by VMManager::flush_all(); default does nothing
 };
 
 // Storage on any Arduino File with seek(), read(), write() and flush().
@@ -167,7 +172,8 @@ class VMFileStorage : public VMStorage {
 public:
     explicit VMFileStorage(FileT& file);
     bool read(uint32_t offset, uint8_t* buf, size_t len) override;
-    bool write(uint32_t offset, const uint8_t* buf, size_t len) override;   // flushes after each write
+    bool write(uint32_t offset, const uint8_t* buf, size_t len) override;
+    bool flush() override;   // file.flush()
 };
 ```
 
@@ -180,7 +186,7 @@ public:
 
     bool begin(VMStorage& storage);   // discards all previous data
     void end();                       // discards all pages, writes nothing
-    bool flush_all();                 // writes modified resident pages; false if a write failed
+    bool flush_all();                 // writes modified resident pages, then storage.flush(); false if a write failed
 
     VMError last_error() const;       // last error since begin() or clear_error()
     void clear_error();

@@ -2,11 +2,11 @@
 //
 // Wiring: SD card on the board's default SPI pins (see SwapFile.h).
 
-// Pinning needs 3 unpinned resident pages, so AVR's default of 3 allows no
-// pins. Four resident pages allow one; smaller pages keep the RAM use as low
-// as the default (4 * 64 bytes). Must come before the include.
+// Pins must leave 4 resident pages unpinned for the containers' own work,
+// so AVR's default of 4 allows none. Five smaller pages allow one and use
+// less RAM than the default (5 * 64 bytes). Must come before the include.
 #if defined(__AVR__)
-#define VM_RESIDENT_PAGES 4
+#define VM_RESIDENT_PAGES 5
 #define VM_PAGE_SIZE      64
 #endif
 
@@ -56,20 +56,8 @@ void setup() {
         Serial.println(text.get());
     }
 
-    // ---- Modify a container that is stored inside virtual memory ----
-    // Growing the inner vector touches several pages while its own fields,
-    // inside rows[0]'s page, are updated. Pin the outer element first.
-    VMVector<VMVector<long> > rows;
-    rows.emplace_back();
-    {
-        VMPin<VMVector<long> > row(rows[0]);
-        for (long i = 0; i < 300; ++i) row->push_back(i * 2);
-    }
-    Serial.print(F("rows[0].back() = "));
-    Serial.println(rows[0].back()); // 598
-
     // ---- Pins are limited ----
-    // At most VM_RESIDENT_PAGES - 3 different pages can be pinned at once.
+    // At most VM_RESIDENT_PAGES - 4 different pages can be pinned at once.
     VMPin<long> a(values[0]);
     VMPin<long> b(values[count - 1]); // the last page
     Serial.print(F("First pin valid: "));

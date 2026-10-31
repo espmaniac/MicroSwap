@@ -6,11 +6,11 @@ SANITIZE  = -fsanitize=address,undefined -fno-omit-frame-pointer
 DEFAULT_FLAGS = -std=c++17 -g $(WARNINGS) $(SANITIZE)
 
 # AVR-like configuration: C++11 (as used by the AVR core), no STL, tiny
-# pages and only three of them in RAM, so pages are swapped constantly.
+# pages and only four of them in RAM (the minimum), so pages are swapped constantly.
 # (Real AVR uses VM_HEAP_ALIGN=2; desktop types need 8.) The LRU counter
 # is renumbered every 1000 accesses instead of every 2^32.
 SMALL_FLAGS = -std=c++11 -g $(WARNINGS) $(SANITIZE) \
-              -DVM_USE_STL=0 -DVM_PAGE_SIZE=128 -DVM_RESIDENT_PAGES=3 \
+              -DVM_USE_STL=0 -DVM_PAGE_SIZE=128 -DVM_RESIDENT_PAGES=4 \
               -DVM_PAGE_COUNT=64 -DVM_HEAP_ALIGN=8 -DVM_TICK_LIMIT=1000
 
 test: test_default test_small

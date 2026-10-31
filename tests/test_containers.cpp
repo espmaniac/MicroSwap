@@ -375,13 +375,14 @@ static void test_writes_through_references_are_saved() {
 }
 
 static void test_references_survive_counter_overflow() {
-    // In the small configuration VM_TICK_LIMIT is low, so the access
-    // counter is renumbered many times during this loop.
+    // Enough accesses to renumber the LRU counter several times: with a
+    // low VM_TICK_LIMIT, or with a 16-bit counter at its real limit.
+    const size_t rounds = VM_TICK_LIMIT <= 0xFFFFUL ? size_t(VM_TICK_LIMIT) * 2 : 5000;
     VMVector<int> v;
     for (size_t i = 0; i < INTS_PER_PAGE * 8; ++i) v.push_back(int(i));
 
     size_t stale = 0;
-    for (size_t k = 0; k < 5000; ++k) {
+    for (size_t k = 0; k < rounds; ++k) {
         const size_t a = (k % 8) * INTS_PER_PAGE;
         const size_t b = ((k * 3 + 1) % 8) * INTS_PER_PAGE;
         int& ref = v[a];
@@ -1038,8 +1039,8 @@ static void test_string_algorithms() {
 int main() {
     // Unbuffered output shows which test was running if one crashes.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("Config: page=%d resident=%d pages=%d stl=%d\n\n",
-                VM_PAGE_SIZE, VM_RESIDENT_PAGES, VM_PAGE_COUNT, VM_USE_STL);
+    std::printf("Config: page=%d resident=%d pages=%d stl=%d tick=%d bits\n\n",
+                VM_PAGE_SIZE, VM_RESIDENT_PAGES, VM_PAGE_COUNT, VM_USE_STL, VM_TICK_BITS);
 
     struct Test { const char* name; void (*fn)(); };
     const Test tests[] = {

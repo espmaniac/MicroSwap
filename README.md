@@ -17,9 +17,14 @@ Any Arduino core with a C++11 compiler. The library uses no exceptions, no RTTI 
 | Board | Core | `<algorithm>` support |
 |---|---|---|
 | Arduino Uno, Mega | AVR | no (the core has no STL) |
+| Arduino Nano Every | megaAVR | no |
+| Arduino Due | SAM | no |
+| Arduino Nano 33 BLE | Mbed (nRF52840) | yes |
+| Arduino Nano RP2040 Connect | Mbed (RP2040) | yes |
+| Teensy 4.1 | Teensyduino | yes |
 | Arduino MKR Zero | SAMD | yes |
 | Arduino Uno R4 Minima | Renesas | yes |
-| ESP32, ESP32-C3 | esp32 | yes |
+| ESP32, ESP32-C3, ESP32-S3 | esp32 | yes |
 | NodeMCU (ESP8266) | esp8266 | yes |
 | Blue Pill (STM32F103) | STM32duino | yes |
 | Raspberry Pi Pico | arduino-pico | yes |
@@ -129,6 +134,7 @@ Define these as build flags, or with `#define` before `#include <MicroSwap.h>` i
 | `VM_PAGE_COUNT` | Total virtual pages | 48 | 256 | 128 |
 | `VM_HEAP_ALIGN` | Alignment of stored objects | 2 | 8 | 8 |
 | `VM_TICK_BITS` | Width of the least-recently-used counter (16 or 32) | 16 | 32 | 32 |
+| `VM_YIELD()` | Called after every page transferred to or from storage | — | — | `yield()` on ESP8266, nothing elsewhere |
 
 RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
 

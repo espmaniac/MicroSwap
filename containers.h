@@ -142,12 +142,7 @@ public:
         if (!swap_write) return false;
 
         // Pre-size the file to the required number of pages by writing zeros.
-        uint8_t zero[VM_PAGE_SIZE] = {0};
-        for (size_t i = 0; i < page_count; i++) {
-            swap_write.seek(i * page_size);
-            swap_write.write(zero, page_size);
-        }
-        swap_write.flush();
+        write_zeros(0, page_count * page_size);
 
         // Open a separate read handle. Keeping both avoids reliance on "r+".
         swap_read = fs->open(swap_path, FILE_READ);
@@ -525,18 +520,73 @@ private:
         size_t hdr_off = payload_off - BH_SIZE;
         if (hdr_off + BH_SIZE > page_size) return;
 
-        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
-        BlockHeader* bh = reinterpret_cast<BlockHeader*>(pg.ram_addr + hdr_off);
+        BlockHeader* bh = block_at(pg, hdr_off);
+        if (bh->flags & 1) return; // already free
 
-        // Basic sanity
-        if ((bh->flags & 1) == 0) {
-            // Mark as free and push to free list head (no coalescing to keep it simple)
-            bh->flags = 1;
-            bh->next_free = hh->first_free;
-            hh->first_free = (uint32_t)hdr_off;
-            hh->total_free += bh->size;
-            pg.dirty = true;
+        bh->flags = 1;
+        pg.dirty = true;
+        heap_coalesce(page_idx);
+
+        // A heap page with no live blocks is returned to the page pool.
+        if (heap_page_is_empty(page_idx)) free_page(page_idx);
+    }
+
+    /**
+     * @brief Block header located at a byte offset inside a heap page.
+     */
+    static BlockHeader* block_at(VMPage& pg, size_t off) {
+        return reinterpret_cast<BlockHeader*>(pg.ram_addr + off);
+    }
+
+    /**
+     * @brief Merge physically adjacent free blocks and rebuild the free list.
+     * @param page_idx Heap page index (must be resident in RAM).
+     *
+     * @details Blocks are laid out back to back right after the heap header and
+     *          fill the page exactly, so the page can be walked block by block.
+     *          Without merging, freed blocks stay small and the heap fragments
+     *          until no request fits anymore.
+     */
+    void heap_coalesce(int page_idx) {
+        VMPage& pg = pages[page_idx];
+        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+
+        uint32_t free_head = 0;
+        uint32_t free_tail = 0;
+        uint32_t total_free = 0;
+
+        size_t off = HH_SIZE;
+        while (off + BH_SIZE <= page_size) {
+            BlockHeader* bh = block_at(pg, off);
+            size_t next_off = off + BH_SIZE + bh->size;
+
+            if (bh->flags & 1) {
+                // Absorb every free block that directly follows this one.
+                while (next_off + BH_SIZE <= page_size && (block_at(pg, next_off)->flags & 1)) {
+                    bh->size += (uint32_t)(BH_SIZE + block_at(pg, next_off)->size);
+                    next_off = off + BH_SIZE + bh->size;
+                }
+
+                bh->next_free = 0;
+                if (free_tail) block_at(pg, free_tail)->next_free = (uint32_t)off;
+                else           free_head = (uint32_t)off;
+                free_tail = (uint32_t)off;
+                total_free += bh->size;
+            }
+            off = next_off;
         }
+
+        hh->first_free = free_head;
+        hh->total_free = total_free;
+    }
+
+    /**
+     * @brief True if the heap page consists of a single free block (no live allocations).
+     */
+    bool heap_page_is_empty(int page_idx) {
+        VMPage& pg = pages[page_idx];
+        HeapHeader* hh = reinterpret_cast<HeapHeader*>(pg.ram_addr);
+        return hh->first_free == HH_SIZE && block_at(pg, HH_SIZE)->size == heap_max_payload();
     }
 
     /**
@@ -832,16 +882,8 @@ private:
         VMPage& page = pages[idx];
         if (!page.allocated) return true;
 
-        if (page.in_ram && page.ram_addr) {
-            if (!wipe) swap_out(idx, false);
-        }
-
-        if (wipe) {
-            uint8_t zero[VM_PAGE_SIZE] = {0};
-            swap_write.seek(page.swap_offset);
-            swap_write.write(zero, page_size);
-            swap_write.flush();
-        }
+        // Freed contents are never read back, so they are not written to swap.
+        if (wipe) write_zeros(page.swap_offset, page_size);
 
         if (page.ram_addr) {
             free(page.ram_addr);
@@ -854,6 +896,25 @@ private:
         page.is_heap = false;
         page.last_access = ++access_tick;
         return true;
+    }
+
+    /**
+     * @brief Write zero bytes to the swap file.
+     * @param offset Byte offset in the swap file.
+     * @param len Number of bytes.
+     *
+     * @note Uses a small stack buffer: a page-sized one could overflow
+     *       the Arduino loop task stack (8 KB on ESP32).
+     */
+    void write_zeros(size_t offset, size_t len) {
+        uint8_t zero[256] = {0};
+        swap_write.seek(offset);
+        while (len > 0) {
+            size_t n = std::min(len, sizeof(zero));
+            swap_write.write(zero, n);
+            len -= n;
+        }
+        swap_write.flush();
     }
 
     /**
@@ -1647,6 +1708,8 @@ public:
     using reverse_iterator       = detail::GenericReverseIterator<iterator>;
     using const_reverse_iterator = detail::GenericReverseIterator<const_iterator>;
 
+    static_assert(sizeof(T) <= VM_PAGE_SIZE, "VMVector: element type must fit in one page");
+
     /// Default constructor (starts in flat mode).
     VMVector() : _chunk_capacity(VM_PAGE_SIZE / sizeof(T)), _chunk_count(0), _size(0),
                  _flat_mode(true), _flat_page(-1), _flat_offset(0), _flat_capacity(0) {
@@ -1724,15 +1787,7 @@ public:
      * @return Reference.
      */
     reference operator[](size_type idx) {
-        if (_flat_mode) {
-            T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
-            return base[idx];
-        } else {
-            size_type chunk_num = idx / _chunk_capacity;
-            size_type offset    = idx % _chunk_capacity;
-            Chunk& ch = _chunks[chunk_num];
-            return *reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, offset * sizeof(T)));
-        }
+        return _flat_mode ? *flat_element(idx) : *paged_element(idx);
     }
     /**
      * @brief Unchecked element access (read intent).
@@ -1828,24 +1883,7 @@ public:
      * @brief Append element by copy.
      * @param value Value to copy.
      */
-    void push_back(const T& value) {
-        if (_flat_mode) {
-            ensure_flat_back_slot();
-            if (_flat_mode) {
-                // Still in flat mode
-                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
-                new(&base[_size]) T(value);
-                _size++;
-                return;
-            }
-        }
-        // Paged mode (or transitioned to paged)
-        ensure_back_slot();
-        Chunk& ch = _chunks[_chunk_count - 1];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
-        new(ptr) T(value);
-        ch.count++; _size++;
-    }
+    void push_back(const T& value) { emplace_back(value); }
 
     /**
      * @brief In-place construct element at end.
@@ -1855,23 +1893,21 @@ public:
      */
     template<typename... Args>
     reference emplace_back(Args&&... args) {
+        if (_flat_mode) ensure_flat_back_slot(); // may switch to paged mode
+
         if (_flat_mode) {
-            ensure_flat_back_slot();
-            if (_flat_mode) {
-                // Still in flat mode
-                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
-                new(&base[_size]) T(std::forward<Args>(args)...);
-                _size++;
-                return base[_size - 1];
-            }
+            T* slot = flat_element(_size);
+            new(slot) T(std::forward<Args>(args)...);
+            _size++;
+            return *slot;
         }
-        // Paged mode (or transitioned to paged)
-        ensure_back_slot();
-        Chunk& ch = _chunks[_chunk_count - 1];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
-        new(ptr) T(std::forward<Args>(args)...);
-        ch.count++; _size++;
-        return *ptr;
+
+        ensure_chunk_for(_size);
+        T* slot = paged_element(_size);
+        new(slot) T(std::forward<Args>(args)...);
+        chunk_of(_size).count++;
+        _size++;
+        return *slot;
     }
 
     /**
@@ -1898,26 +1934,22 @@ public:
      */
     void pop_back() {
         if (_size == 0) throw std::out_of_range("VMVector::pop_back");
+        const size_type last = _size - 1;
+
         if (_flat_mode) {
-            T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
-            base[_size - 1].~T();
+            flat_element(last)->~T();
             _size--;
             return;
         }
-        // Paged mode
+
+        paged_element(last)->~T();
+        chunk_of(last).count--;
         _size--;
-        size_type chunk_num = _size / _chunk_capacity;
-        size_type offset    = _size % _chunk_capacity;
-        if (offset == 0 && chunk_num > 0) chunk_num--;
-        Chunk& ch = _chunks[chunk_num];
-        T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, (ch.count - 1) * sizeof(T)));
-        ptr->~T();
-        ch.count--;
-        if (ch.count == 0) {
-            VMManager::instance().page_free(ch.page_idx);
-            ch.page_idx = -1;
-            _chunk_count--;
-        }
+
+        // Return the page once the last chunk is empty. Chunks reserved
+        // beyond it keep the emptied one alive, as reserve() asked for them.
+        const bool in_last_chunk = last / _chunk_capacity == _chunk_count - 1;
+        if (in_last_chunk && chunk_of(last).count == 0) release_last_chunk();
     }
 
     /**
@@ -1953,34 +1985,19 @@ public:
      * @brief Destroy all elements and free pages.
      */
     void clear() {
-        if (_flat_mode) {
-            // Destroy elements in flat mode
-            if (_flat_page >= 0 && _size > 0) {
-                T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
-                for (size_type i = 0; i < _size; ++i) {
-                    base[i].~T();
-                }
-                VMManager::instance().small_free(_flat_page, _flat_offset);
-                _flat_page = -1;
-                _flat_offset = 0;
-                _flat_capacity = 0;
-            }
-        } else {
-            // Original paged mode cleanup
-            for (size_type i = 0; i < _chunk_count; ++i) {
-                Chunk& ch = _chunks[i];
-                if (ch.page_idx == -1) continue;
-                for (size_type j = 0; j < ch.count; ++j) {
-                    T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, j * sizeof(T)));
-                    ptr->~T();
-                }
-                VMManager::instance().page_free(ch.page_idx);
-                ch.page_idx = -1;
-                ch.count = 0;
-            }
-            _chunk_count = 0;
-        }
+        for (size_type i = 0; i < _size; ++i)
+            (*this)[i].~T();
         _size = 0;
+
+        if (_flat_page >= 0) {
+            VMManager::instance().small_free(_flat_page, _flat_offset);
+            _flat_page = -1;
+            _flat_offset = 0;
+            _flat_capacity = 0;
+        }
+        while (_chunk_count > 0) release_last_chunk();
+
+        _flat_mode = true; // an emptied vector starts over in flat mode
     }
 
     /**
@@ -2001,33 +2018,23 @@ public:
      * @param n Desired capacity.
      */
     void reserve(size_type n) {
-        size_type required_chunks = (n + _chunk_capacity - 1) / _chunk_capacity;
-        while (_chunk_count < required_chunks) {
-            int page_idx = -1;
-            VMManager::AllocOptions opts;
-            opts.can_free_ram = true;
-            opts.zero_on_alloc = true;
-            opts.reuse_swap_data = false;
-            VMManager::instance().page_alloc(page_idx, opts);
-            _chunks[_chunk_count].page_idx = page_idx;
-            _chunks[_chunk_count].count = 0;
-            _chunk_count++;
+        if (n <= capacity()) return;
+
+        if (_flat_mode) {
+            const size_type max_flat = VMManager::instance().heap_max_payload() / sizeof(T);
+            if (n <= max_flat && grow_flat_block(n)) return;
+            transition_to_paged();
         }
+        while (_chunk_count * _chunk_capacity < n) append_chunk();
     }
 
     /**
-     * @brief Release unused trailing pages.
+     * @brief Release unused trailing pages (paged mode only).
      */
     void shrink_to_fit() {
-        size_type used_chunks = (_size + _chunk_capacity - 1) / _chunk_capacity;
-        for (size_type i = used_chunks; i < _chunk_count; ++i) {
-            if (_chunks[i].page_idx != -1) {
-                VMManager::instance().page_free(_chunks[i].page_idx);
-                _chunks[i].page_idx = -1;
-                _chunks[i].count = 0;
-            }
-        }
-        _chunk_count = used_chunks;
+        if (_flat_mode) return;
+        while (_chunk_count > 0 && _chunks[_chunk_count - 1].count == 0)
+            release_last_chunk();
     }
 
     /**
@@ -2035,11 +2042,14 @@ public:
      * @param other Other vector.
      */
     void swap(VMVector& other) {
+        std::swap(_chunks, other._chunks);
         std::swap(_chunk_capacity, other._chunk_capacity);
-        std::swap(_size, other._size);
         std::swap(_chunk_count, other._chunk_count);
-        for (size_type i = 0; i < VM_PAGE_COUNT; ++i)
-            std::swap(_chunks[i], other._chunks[i]);
+        std::swap(_size, other._size);
+        std::swap(_flat_mode, other._flat_mode);
+        std::swap(_flat_page, other._flat_page);
+        std::swap(_flat_offset, other._flat_offset);
+        std::swap(_flat_capacity, other._flat_capacity);
     }
 
     /**
@@ -2123,117 +2133,114 @@ private:
     size_t _flat_offset;          ///< Offset within page for flat block.
     size_type _flat_capacity;     ///< Capacity in elements for flat block.
 
+    /// Elements are stored by index: element i always lives in chunk i / _chunk_capacity.
+    Chunk& chunk_of(size_type idx) { return _chunks[idx / _chunk_capacity]; }
+
+    /// Pointer to element idx of the flat block (write intent).
+    T* flat_element(size_type idx) {
+        T* base = reinterpret_cast<T*>(VMManager::instance().small_write_ptr(_flat_page, _flat_offset));
+        return base + idx;
+    }
+
+    /// Pointer to element idx in paged mode (write intent).
+    T* paged_element(size_type idx) {
+        const Chunk& ch = chunk_of(idx);
+        const size_t byte_off = (idx % _chunk_capacity) * sizeof(T);
+        return reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, byte_off));
+    }
+
+    /**
+     * @brief Allocate one more page and append it to the chunk table.
+     * @throws std::runtime_error If the chunk table is full or no page is available.
+     */
+    void append_chunk() {
+        if (_chunk_count >= VM_PAGE_COUNT)
+            throw std::runtime_error("VMVector: chunk table is full");
+        int page_idx = -1;
+        if (!VMManager::instance().page_alloc(page_idx))
+            throw std::runtime_error("VMVector: out of virtual memory pages");
+        _chunks[_chunk_count].page_idx = page_idx;
+        _chunks[_chunk_count].count = 0;
+        _chunk_count++;
+    }
+
+    /// Free the page of the last chunk in the table.
+    void release_last_chunk() {
+        Chunk& ch = _chunks[_chunk_count - 1];
+        VMManager::instance().page_free(ch.page_idx);
+        ch.page_idx = -1;
+        ch.count = 0;
+        _chunk_count--;
+    }
+
+    /// Make sure the chunk that holds element idx is allocated (paged mode).
+    void ensure_chunk_for(size_type idx) {
+        while (idx / _chunk_capacity >= _chunk_count) append_chunk();
+    }
+
     /**
      * @brief Ensure space for one more element in flat mode; transition to paged if needed.
      */
     void ensure_flat_back_slot() {
-        // First-time allocation in flat mode
-        if (_flat_page < 0) {
-            // Start with a reasonable initial capacity
-            size_t initial_cap = 16; // elements
-            if (initial_cap * sizeof(T) > VMManager::instance().heap_max_payload()) {
-                initial_cap = VMManager::instance().heap_max_payload() / sizeof(T);
-            }
-            if (initial_cap < 1) initial_cap = 1;
-            
-            size_t needed = initial_cap * sizeof(T);
-            size_t alloc_sz = 0;
-            if (VMManager::instance().small_alloc(needed, alignof(T), _flat_page, _flat_offset, alloc_sz)) {
-                _flat_capacity = alloc_sz / sizeof(T);
-                return;
-            }
-            // If small_alloc fails, transition to paged mode immediately
+        if (_flat_page >= 0 && _size < _flat_capacity) return;
+
+        const size_type max_flat = VMManager::instance().heap_max_payload() / sizeof(T);
+        const size_type new_cap  = (_flat_page < 0) ? std::min<size_type>(16, max_flat)
+                                                    : _flat_capacity * 2;
+
+        if (new_cap == 0 || new_cap > max_flat || !grow_flat_block(new_cap))
             transition_to_paged();
-            return;
-        }
-        
-        // Check if we have space
-        if (_size < _flat_capacity) {
-            return; // Space available
-        }
-        
-        // Try to grow the flat buffer
-        size_t new_cap = _flat_capacity * 2;
-        if (new_cap * sizeof(T) > VMManager::instance().heap_max_payload()) {
-            // Can't fit in a single heap block, must transition to paged
-            transition_to_paged();
-            return;
-        }
-        
-        // Try reallocation
-        int new_page = -1;
-        size_t new_offset = 0;
-        size_t new_alloc = 0;
-        size_t needed = new_cap * sizeof(T);
-        size_t copy_bytes = _size * sizeof(T);
-        
-        if (VMManager::instance().small_realloc_move(_flat_page, _flat_offset, needed,
-                                                      new_page, new_offset, new_alloc, copy_bytes)) {
-            _flat_page = new_page;
-            _flat_offset = new_offset;
-            _flat_capacity = new_alloc / sizeof(T);
-            return;
-        }
-        
-        // Reallocation failed, transition to paged mode
-        transition_to_paged();
-    }
-    
-    /**
-     * @brief Transition from flat mode to paged mode.
-     */
-    void transition_to_paged() {
-        if (!_flat_mode) return;
-        
-        // Copy existing elements from flat buffer to paged chunks
-        if (_size > 0 && _flat_page >= 0) {
-            T* flat_base = reinterpret_cast<T*>(VMManager::instance().small_read_ptr(_flat_page, _flat_offset));
-            
-            // Allocate chunks as needed and copy elements
-            for (size_type i = 0; i < _size; ++i) {
-                if (_chunk_count == 0 || _chunks[_chunk_count - 1].count >= _chunk_capacity) {
-                    int page_idx = -1;
-                    VMManager::AllocOptions opts;
-                    opts.can_free_ram = true;
-                    opts.zero_on_alloc = true;
-                    opts.reuse_swap_data = false;
-                    VMManager::instance().page_alloc(page_idx, opts);
-                    _chunks[_chunk_count].page_idx = page_idx;
-                    _chunks[_chunk_count].count = 0;
-                    _chunk_count++;
-                }
-                
-                Chunk& ch = _chunks[_chunk_count - 1];
-                T* ptr = reinterpret_cast<T*>(VMManager::instance().page_write_ptr(ch.page_idx, ch.count * sizeof(T)));
-                new(ptr) T(flat_base[i]); // Copy construct
-                ch.count++;
-            }
-            
-            // Free the flat buffer
-            VMManager::instance().small_free(_flat_page, _flat_offset);
-        }
-        
-        _flat_mode = false;
-        _flat_page = -1;
-        _flat_offset = 0;
-        _flat_capacity = 0;
     }
 
     /**
-     * @brief Ensure space for one more element, allocate new page if needed (paged mode).
+     * @brief Move the flat elements into a new heap block holding at least new_cap elements.
+     * @return False if the heap cannot provide such a block (the vector is left unchanged).
      */
-    void ensure_back_slot() {
-        if (_chunk_count == 0 || _chunks[_chunk_count - 1].count >= _chunk_capacity) {
-            int page_idx = -1;
-            VMManager::AllocOptions opts;
-            opts.can_free_ram = true;
-            opts.zero_on_alloc = true;
-            opts.reuse_swap_data = false;
-            VMManager::instance().page_alloc(page_idx, opts);
-            _chunks[_chunk_count].page_idx = page_idx;
-            _chunks[_chunk_count].count = 0;
-            _chunk_count++;
+    bool grow_flat_block(size_type new_cap) {
+        auto& mgr = VMManager::instance();
+        int new_page = -1;
+        size_t new_offset = 0;
+        size_t new_bytes = 0;
+        if (!mgr.small_alloc(new_cap * sizeof(T), alignof(T), new_page, new_offset, new_bytes))
+            return false;
+
+        // Elements are moved one by one (not memcpy'd) so non-trivial types stay valid.
+        for (size_type i = 0; i < _size; ++i) {
+            T* dst = reinterpret_cast<T*>(mgr.small_write_ptr(new_page, new_offset)) + i;
+            T* src = flat_element(i);
+            new(dst) T(std::move(*src));
+            src->~T();
         }
+
+        if (_flat_page >= 0) mgr.small_free(_flat_page, _flat_offset);
+        _flat_page     = new_page;
+        _flat_offset   = new_offset;
+        _flat_capacity = new_bytes / sizeof(T);
+        return true;
+    }
+
+    /**
+     * @brief Move all elements from the flat block into page-sized chunks.
+     * @throws std::runtime_error If pages run out; the vector then stays in flat mode.
+     */
+    void transition_to_paged() {
+        if (!_flat_mode) return;
+
+        // Allocate every chunk first, so a failure leaves the elements untouched.
+        if (_size > 0) ensure_chunk_for(_size - 1);
+
+        for (size_type i = 0; i < _size; ++i) {
+            T* src = flat_element(i);
+            new(paged_element(i)) T(std::move(*src));
+            src->~T();
+            chunk_of(i).count++;
+        }
+
+        if (_flat_page >= 0) VMManager::instance().small_free(_flat_page, _flat_offset);
+        _flat_mode     = false;
+        _flat_page     = -1;
+        _flat_offset   = 0;
+        _flat_capacity = 0;
     }
 };
 

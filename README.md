@@ -12,7 +12,7 @@ MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an S
 
 ## Supported boards
 
-Any Arduino core with a C++11 compiler. The library uses neither exceptions nor RTTI, and needs no STL or `FS.h`. Every push is compiled in CI for:
+Any Arduino core with a C++11 compiler. The library uses no exceptions, no RTTI and no `malloc` (all of its RAM is static, so the IDE reports it at compile time), and needs no STL or `FS.h`. Every push is compiled in CI for:
 
 | Board | Core | `<algorithm>` support |
 |---|---|---|
@@ -170,7 +170,14 @@ for (size_t i = 0; i < v.size(); ++i) total += v[i];
 
 The containers need 4 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 4` different pages can be pinned at once; pins on the same page count once. That is one pin by default, four on ESP32, and none on AVR: there, set `VM_RESIDENT_PAGES` to 5 to pin one page (or 5 pages of 64 bytes, as the `Pin` example does, to keep the RAM use). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
 
-**Containers inside containers.** A container can be stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors. Each operation keeps in RAM the page of the container itself and of the objects passed to it, so this works like any other use. It needs up to 4 resident pages at once, plus one for each further level of nesting (a vector of vectors of objects with strings needs 5). If there are not enough, the operation reports `VMError::TooManyPins` before anything is changed; the default handler stops the program there. A handler that returns lets the operation continue, and data may then be corrupted.
+**Containers inside containers.** A container can be stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors. Each operation keeps in RAM the page of the container itself and of the objects passed to it, and every element access marks the container's page as used, so a reference to an inner container stays valid while you keep using it:
+
+```cpp
+const VMVector<long>& row = rows[2];
+for (size_t i = 0; i < row.size(); ++i) total += row[i]; // fine
+```
+
+An operation needs up to 4 resident pages at once. Deeper nesting, or an operation between two inner containers on different pages (copying or comparing `rows[1]` and `rows[3]`), can need one or two more. If there are not enough, the operation reports `VMError::TooManyPins` and, where it can, stops before changing anything; the default handler stops the program there. A handler that returns may see data corrupted in the cases the library cannot stop.
 
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 
@@ -190,7 +197,6 @@ enum class VMError : uint8_t {
     NotStarted,   // VMManager::begin() has not been called
     OutOfPages,   // every virtual page is in use
     TooLarge,     // the object does not fit in one page
-    OutOfMemory,  // malloc failed (VMVector chunk table)
     StorageIO,    // reading or writing the swap file failed
     OutOfRange,   // index out of range: at(), front()/back()/pop_back() on empty, ...
     NullPointer,  // a null VMPtr was dereferenced
@@ -209,10 +215,12 @@ void vm_default_error_handler(VMError);     // calls abort()
 // Interface: implement it to store pages anywhere.
 class VMStorage {
 public:
-    virtual ~VMStorage();
     virtual bool read(uint32_t offset, uint8_t* buf, size_t len) = 0;
     virtual bool write(uint32_t offset, const uint8_t* buf, size_t len) = 0;
     virtual bool flush();   // called by VMManager::flush_all(); default does nothing
+
+protected:
+    ~VMStorage();           // not virtual, so no malloc is linked: do not delete through VMStorage*
 };
 
 // Storage on any Arduino File with seek(), read(), write() and flush().

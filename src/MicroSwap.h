@@ -17,9 +17,9 @@
  *
  * Portability: needs only a C++11 compiler and the C standard library, so it
  * builds for AVR, ESP32, ESP8266, STM32, SAMD, RP2040 and desktop machines.
- * It does not use exceptions or RTTI. The STL is used only when available,
- * to make the iterators work with <algorithm>. RAM for resident pages is
- * allocated statically; malloc is used only for VMVector's chunk table.
+ * It does not use exceptions, RTTI or malloc: all of its RAM is allocated
+ * statically, so its size is known at compile time. The STL is used only
+ * when available, to make the iterators work with <algorithm>.
  *
  * Reference lifetime: references and pointers returned by the containers
  * point into a resident page. They stay valid until other pages are loaded
@@ -87,6 +87,11 @@
 #ifndef VM_HEAP_ALIGN
 /// Alignment of objects stored in pages.
 #define VM_HEAP_ALIGN VM_DEFAULT_HEAP_ALIGN
+#endif
+
+#ifndef VM_USER_PIN_RESERVE
+/// Testing only: resident pages that VMPins must leave unpinned.
+#define VM_USER_PIN_RESERVE 4
 #endif
 
 #ifndef VM_TICK_LIMIT
@@ -225,7 +230,6 @@ enum class VMError : uint8_t {
     NotStarted,  ///< VMManager::begin() has not been called.
     OutOfPages,  ///< Every virtual page is in use.
     TooLarge,    ///< The object does not fit in one page.
-    OutOfMemory, ///< malloc failed (VMVector chunk table).
     StorageIO,   ///< Reading or writing the swap file failed.
     OutOfRange,  ///< Index out of range (at(), front(), pop_back() on empty, ...).
     NullPointer, ///< A null VMPtr was dereferenced.
@@ -239,7 +243,6 @@ inline const char* vm_error_name(VMError error) {
         case VMError::NotStarted:  return "NotStarted";
         case VMError::OutOfPages:  return "OutOfPages";
         case VMError::TooLarge:    return "TooLarge";
-        case VMError::OutOfMemory: return "OutOfMemory";
         case VMError::StorageIO:   return "StorageIO";
         case VMError::OutOfRange:  return "OutOfRange";
         case VMError::NullPointer: return "NullPointer";
@@ -272,11 +275,16 @@ inline void vm_default_error_handler(VMError) { abort(); }
  */
 class VMStorage {
 public:
-    virtual ~VMStorage() {}
     virtual bool read(uint32_t offset, uint8_t* buf, size_t len) = 0;
     virtual bool write(uint32_t offset, const uint8_t* buf, size_t len) = 0;
     /// Called by VMManager::flush_all() after writing pages.
     virtual bool flush() { return true; }
+
+protected:
+    // Not virtual: storages are never deleted through a VMStorage pointer.
+    // A virtual destructor would pull operator delete, and with it malloc
+    // and free, into every program.
+    ~VMStorage() {}
 };
 
 /**
@@ -423,7 +431,10 @@ private:
     struct PageEntry {
         uint8_t  flags;        ///< PAGE_* bits.
         uint8_t  frame;        ///< Resident page holding it, or kNoFrame.
-        uint16_t heap_largest; ///< Heap pages: largest free block, so full pages are skipped without loading them.
+        union {
+            uint16_t heap_largest; ///< Heap pages: largest free block, so full pages are skipped without loading them.
+            uint16_t next_chunk;   ///< VMVector pages: next page of the same vector, or kNoPage.
+        };
     };
 
     /// A resident page slot in RAM.
@@ -665,9 +676,17 @@ private:
         return true;
     }
 
+    // -------------------- VMVector page chains --------------------
+    //
+    // The pages of a paged VMVector are linked through the page table, so a
+    // vector needs no table of its own.
+
+    uint16_t next_chunk(uint16_t page) const { return _pages[page].next_chunk; }
+    void set_next_chunk(uint16_t page, uint16_t next) { _pages[page].next_chunk = next; }
+
     // -------------------- Pins --------------------
 
-    enum : uint8_t { kMinUnpinned = 4 }; ///< Container operations need up to 4 pages at once.
+    enum : uint8_t { kMinUnpinned = VM_USER_PIN_RESERVE }; ///< Container operations need up to 4 pages at once.
 
     /// Resident slot whose RAM contains `address`, or kNoFrame.
     uint8_t frame_of(const void* address) const {
@@ -675,6 +694,19 @@ private:
         const uintptr_t base = reinterpret_cast<uintptr_t>(&_frame_data[0][0]);
         if (a < base || a >= base + uintptr_t(VM_RESIDENT_PAGES) * VM_PAGE_SIZE) return vm_detail::kNoFrame;
         return uint8_t((a - base) / VM_PAGE_SIZE);
+    }
+
+    /**
+     * @brief Mark the resident page holding `address` (if any) as just used.
+     *
+     * Containers call this with `this` on every element access. A container
+     * stored in virtual memory and used through a reference (for example
+     * `for (long x : rows[2])`) then keeps its own page resident for as long
+     * as it is being used, like any other recently used page.
+     */
+    void touch(const void* address) {
+        const uint8_t f = frame_of(address);
+        if (f != vm_detail::kNoFrame && _frames[f].page != vm_detail::kNoPage) _frames[f].last_use = next_tick();
     }
 
     uint8_t pinned_frames() const {
@@ -704,15 +736,34 @@ private:
     /**
      * @brief Pin for the duration of one container operation (see KeepResident).
      *
-     * Unlike pin(), this has no limit: an operation must be able to keep
-     * the objects it works on.
+     * Not limited like pin(), but at least one page always stays unpinned
+     * so that pages can still be loaded.
      */
     uint8_t pin_internal(const void* address) {
         const uint8_t f = frame_of(address);
         if (f == vm_detail::kNoFrame || _frames[f].page == vm_detail::kNoPage) return vm_detail::kNoFrame;
-        if (_frames[f].pins == 0xFF) { fail(VMError::TooManyPins); return vm_detail::kNoFrame; }
+        const bool last_unpinned = _frames[f].pins == 0 && pinned_frames() + 1 >= VM_RESIDENT_PAGES;
+        if (last_unpinned || _frames[f].pins == 0xFF) {
+            fail(VMError::TooManyPins);
+            return vm_detail::kNoFrame;
+        }
         _frames[f].pins++;
         return f;
+    }
+
+    /**
+     * @brief Check that `n` unpinned pages are available.
+     *
+     * Called before a step that holds pointers into `n` unpinned pages at
+     * once (copying from an old block to a new one, or between two
+     * elements). With fewer, loading the second page would evict the first
+     * and the copy would read or write the wrong data, so the operation
+     * reports TooManyPins and stops instead.
+     */
+    bool have_working_pages(uint8_t n) {
+        if (VM_RESIDENT_PAGES - pinned_frames() >= n) return true;
+        fail(VMError::TooManyPins);
+        return false;
     }
 
     /// Undo pin() or pin_internal(). Ignored if the page was freed in the meantime.
@@ -927,6 +978,7 @@ private:
             VMManager::instance().fail(VMError::NullPointer);
             return &vm_detail::placeholder<T>();
         }
+        VMManager::instance().touch(this);
         return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, access));
     }
 
@@ -1091,12 +1143,40 @@ public:
     /// Index of the element in the container.
     size_t pos() const { return _pos; }
 
+    /// The container the iterator walks over.
+    ContainerPtr container() const { return _c; }
+
 private:
     template<typename, typename, bool> friend class IndexIterator;
 
     ContainerPtr _c;
     size_t _pos;
 };
+
+/**
+ * @brief The container an iterator walks over, if it is one of ours.
+ *
+ * Lets an operation keep that container's page resident while it reads
+ * through the iterators; for other iterators there is nothing to keep.
+ */
+template<typename Iterator>
+const void* container_of(const Iterator&) { return nullptr; }
+
+template<typename Container, typename ValueType, bool Const>
+const void* container_of(const IndexIterator<Container, ValueType, Const>& it) { return it.container(); }
+
+/// Number of elements in [first, last) if it is known without walking, else 0.
+template<typename Iterator>
+size_t known_distance(const Iterator&, const Iterator&) { return 0; }
+
+template<typename Container, typename ValueType, bool Const>
+size_t known_distance(const IndexIterator<Container, ValueType, Const>& first,
+                      const IndexIterator<Container, ValueType, Const>& last) {
+    return last.pos() - first.pos();
+}
+
+template<typename T>
+size_t known_distance(T* first, T* last) { return size_t(last - first); }
 
 /// Reverse iterator adapter.
 template<typename ForwardIter>
@@ -1237,7 +1317,7 @@ public:
     void shrink_to_fit() {
         vm_detail::KeepResident keep(this);
         if (_flat_mode) return;
-        while (_chunk_count > chunks_for(_size)) release_last_chunk();
+        truncate_chunks(uint16_t(chunks_for(_size)));
     }
 
     // -------------------- Modifiers --------------------
@@ -1262,6 +1342,8 @@ public:
         vm_detail::KeepResident keep(this, &args...);
         const size_type idx = pos.pos();
         const size_type old_size = _size;
+        // Moving the new element into place holds two elements at once.
+        if (idx < _size && !VMManager::instance().have_working_pages(2)) return end();
         emplace_back(vm_detail::forward<Args>(args)...);
         if (_size == old_size) return end();
 
@@ -1278,6 +1360,8 @@ public:
         vm_detail::KeepResident keep(this);
         const size_type idx = pos.pos();
         if (idx >= _size) return end();
+        // Shifting holds two elements at once.
+        if (idx + 1 < _size && !VMManager::instance().have_working_pages(2)) return end();
         for (size_type i = idx; i + 1 < _size; ++i)
             *element(i, vm_detail::Access::Write) = vm_detail::move(*element(i + 1, vm_detail::Access::Write));
         pop_back();
@@ -1291,7 +1375,7 @@ public:
         if (!vm_detail::is_trivially_destructible<T>::value) element(_size, vm_detail::Access::Write)->~T();
 
         // Return a page as soon as the last one becomes empty.
-        if (!_flat_mode && _chunk_count > chunks_for(_size)) release_last_chunk();
+        if (!_flat_mode && _chunk_count > chunks_for(_size)) truncate_chunks(uint16_t(_chunk_count - 1));
     }
 
     /// Destroy all elements and free all storage.
@@ -1307,10 +1391,7 @@ public:
         _flat_capacity = 0;
         _flat_mode = true;
 
-        while (_chunk_count > 0) release_last_chunk();
-        free(_chunks);
-        _chunks = nullptr;
-        _chunk_slots = 0;
+        truncate_chunks(0);
     }
 
     void resize(size_type n, const T& value = T()) {
@@ -1332,8 +1413,12 @@ public:
     /// Only for iterators: assign(4, 1) picks assign(size_type, const T&).
     template<typename InputIt, typename = decltype(*vm_detail::declval<InputIt>())>
     void assign(InputIt first, InputIt last) {
-        vm_detail::KeepResident keep(this);
+        // The source may be another container in virtual memory (v = rows[i]).
+        vm_detail::KeepResident keep(this, vm_detail::container_of(first));
         clear();
+        // Grow once up front where the size is known, so that copying an
+        // element never also has to move the vector to a larger block.
+        reserve(vm_detail::known_distance(first, last));
         for (; first != last; ++first) push_back(*first);
     }
 
@@ -1343,9 +1428,11 @@ public:
         vm_detail::swap(_flat_page, other._flat_page);
         vm_detail::swap(_flat_offset, other._flat_offset);
         vm_detail::swap(_flat_capacity, other._flat_capacity);
-        vm_detail::swap(_chunks, other._chunks);
+        vm_detail::swap(_first_chunk, other._first_chunk);
+        vm_detail::swap(_last_chunk, other._last_chunk);
         vm_detail::swap(_chunk_count, other._chunk_count);
-        vm_detail::swap(_chunk_slots, other._chunk_slots);
+        vm_detail::swap(_cached_chunk, other._cached_chunk);
+        vm_detail::swap(_cached_page, other._cached_page);
     }
 
     // -------------------- Iterators --------------------
@@ -1369,6 +1456,7 @@ public:
     bool operator==(const VMVector& other) const {
         vm_detail::KeepResident keep(this, &other);
         if (_size != other._size) return false;
+        if (!VMManager::instance().have_working_pages(2)) return false; // one element of each
         for (size_type i = 0; i < _size; ++i)
             if (!((*this)[i] == other[i])) return false;
         return true;
@@ -1377,6 +1465,7 @@ public:
 
     bool operator<(const VMVector& other) const {
         vm_detail::KeepResident keep(this, &other);
+        if (!VMManager::instance().have_working_pages(2)) return false; // one element of each
         const size_type n = vm_detail::min_of(_size, other._size);
         for (size_type i = 0; i < n; ++i) {
             if ((*this)[i] < other[i]) return true;
@@ -1397,10 +1486,16 @@ private:
     uint16_t  _flat_offset = 0;
     size_type _flat_capacity = 0;
 
-    // Paged mode: one whole page per chunk; the table itself is in RAM.
-    uint16_t* _chunks = nullptr;
-    uint16_t  _chunk_count = 0;
-    uint16_t  _chunk_slots = 0;
+    // Paged mode: one whole page per chunk. The pages form a chain through
+    // VMManager's page table (see next_chunk()).
+    uint16_t _first_chunk = vm_detail::kNoPage;
+    uint16_t _last_chunk = vm_detail::kNoPage;
+    uint16_t _chunk_count = 0;
+
+    // The last chunk looked up, so that sequential access does not walk the
+    // chain from the start. Every change to the chain resets or keeps it valid.
+    mutable uint16_t _cached_chunk = 0;
+    mutable uint16_t _cached_page = vm_detail::kNoPage;
 
     bool in_range(size_type i) const {
         if (i < _size) return true;
@@ -1413,6 +1508,7 @@ private:
     static size_type chunks_for(size_type n) { return (n + kPerPage - 1) / kPerPage; }
 
     T* element(size_type i, vm_detail::Access access) const {
+        VMManager::instance().touch(this);
         return _flat_mode ? flat_element(i, access) : paged_element(i, access);
     }
 
@@ -1421,8 +1517,34 @@ private:
     }
 
     T* paged_element(size_type i, vm_detail::Access access) const {
-        uint8_t* page = VMManager::instance().page_ptr(_chunks[i / kPerPage], access);
+        uint8_t* page = VMManager::instance().page_ptr(chunk_page(uint16_t(i / kPerPage)), access);
         return reinterpret_cast<T*>(page) + i % kPerPage;
+    }
+
+    /**
+     * @brief Page that holds chunk k (k < _chunk_count).
+     *
+     * Walks the chain from the cached chunk if it is not past k, else from
+     * the first chunk. The walk only reads the page table in RAM.
+     */
+    uint16_t chunk_page(uint16_t k) const {
+        if (k + 1 == _chunk_count) return _last_chunk;
+
+        const VMManager& mgr = VMManager::instance();
+        uint16_t index = 0;
+        uint16_t page = _first_chunk;
+        if (_cached_page != vm_detail::kNoPage && _cached_chunk <= k) {
+            index = _cached_chunk;
+            page = _cached_page;
+        }
+        while (index < k) {
+            page = mgr.next_chunk(page);
+            ++index;
+        }
+
+        _cached_chunk = k;
+        _cached_page = page;
+        return page;
     }
 
     /// Make room for one more element; returns where it goes, or nullptr.
@@ -1446,6 +1568,7 @@ private:
         new_cap = vm_detail::min_of<size_type>(vm_detail::max_of<size_type>(new_cap, 4), kMaxFlat);
 
         VMManager& mgr = VMManager::instance();
+        if (!mgr.have_working_pages(_size > 0 ? 2 : 1)) return false; // old and new block
         uint16_t page = vm_detail::kNoPage;
         uint16_t offset = 0;
         size_t usable = 0;
@@ -1467,6 +1590,8 @@ private:
 
     /// Move the elements from the flat block to whole pages.
     bool transition_to_paged() {
+        // Moving holds the flat block and a page at once.
+        if (_size > 0 && !VMManager::instance().have_working_pages(2)) return false;
         // Allocate first, so a failure leaves the vector untouched.
         if (!ensure_chunks(_size)) return false;
 
@@ -1486,27 +1611,52 @@ private:
 
     /// Allocate pages until n elements fit (paged layout).
     bool ensure_chunks(size_type n) {
-        while (_chunk_count < chunks_for(n)) {
-            if (_chunk_count >= VM_PAGE_COUNT) { VMManager::instance().fail(VMError::OutOfPages); return false; }
-            if (_chunk_count == _chunk_slots && !grow_chunk_table()) return false;
-            const uint16_t page = VMManager::instance().alloc_page();
-            if (page == vm_detail::kNoPage) return false;
-            _chunks[_chunk_count++] = page;
+        while (_chunk_count < chunks_for(n))
+            if (!append_chunk()) return false;
+        return true;
+    }
+
+    /// Allocate a page and add it to the end of the chain.
+    bool append_chunk() {
+        VMManager& mgr = VMManager::instance();
+        if (_chunk_count >= VM_PAGE_COUNT) { mgr.fail(VMError::OutOfPages); return false; }
+        const uint16_t page = mgr.alloc_page();
+        if (page == vm_detail::kNoPage) return false;
+
+        mgr.set_next_chunk(page, vm_detail::kNoPage);
+        if (_chunk_count == 0) _first_chunk = page;
+        else mgr.set_next_chunk(_last_chunk, page);
+        _last_chunk = page;
+        _chunk_count++;
+        return true; // existing chunks keep their indices, so the cache stays valid
+    }
+
+    /// Free every chunk after the first `keep` ones.
+    void truncate_chunks(uint16_t keep) {
+        if (keep >= _chunk_count) return;
+        VMManager& mgr = VMManager::instance();
+
+        uint16_t page;
+        if (keep == 0) {
+            page = _first_chunk;
+            _first_chunk = vm_detail::kNoPage;
+            _last_chunk = vm_detail::kNoPage;
+        } else {
+            const uint16_t new_last = chunk_page(uint16_t(keep - 1));
+            page = mgr.next_chunk(new_last);
+            mgr.set_next_chunk(new_last, vm_detail::kNoPage);
+            _last_chunk = new_last;
         }
-        return true;
-    }
 
-    bool grow_chunk_table() {
-        const uint16_t slots = vm_detail::min_of<uint16_t>(_chunk_slots ? _chunk_slots * 2 : 4, VM_PAGE_COUNT);
-        uint16_t* table = static_cast<uint16_t*>(realloc(_chunks, slots * sizeof(uint16_t)));
-        if (!table) { VMManager::instance().fail(VMError::OutOfMemory); return false; }
-        _chunks = table;
-        _chunk_slots = slots;
-        return true;
-    }
+        // Read the link before freeing: free_page() clears the entry.
+        for (uint16_t n = uint16_t(_chunk_count - keep); n > 0; --n) {
+            const uint16_t next = mgr.next_chunk(page);
+            mgr.free_page(page);
+            page = next;
+        }
 
-    void release_last_chunk() {
-        VMManager::instance().free_page(_chunks[--_chunk_count]);
+        _chunk_count = keep;
+        if (_cached_chunk >= keep) _cached_page = vm_detail::kNoPage;
     }
 };
 
@@ -1542,7 +1692,7 @@ public:
 
     VMArray(const VMArray& other) {
         vm_detail::KeepResident keep(this, &other);
-        if (!other.allocated() || !allocate()) return;
+        if (!other.allocated() || !VMManager::instance().have_working_pages(2) || !allocate()) return;
         for (size_type i = 0; i < N; ++i) new (raw_element(i)) T(other[i]);
     }
 
@@ -1552,6 +1702,7 @@ public:
 
     VMArray& operator=(const VMArray& other) {
         vm_detail::KeepResident keep(this, &other);
+        if (!VMManager::instance().have_working_pages(2)) return *this; // source and destination block
         if (this != &other)
             for (size_type i = 0; i < N; ++i) *element(i, vm_detail::Access::Write) = other[i];
         return *this;
@@ -1638,6 +1789,7 @@ private:
     }
 
     T* element(size_type i, vm_detail::Access access) const {
+        VMManager::instance().touch(this);
         if (!allocated()) {
             vm_detail::KeepResident keep(this);
             if (!allocate()) return &vm_detail::placeholder<T>();
@@ -1917,6 +2069,7 @@ private:
     bool has_block() const { return _page != vm_detail::kNoPage; }
 
     char* buffer(vm_detail::Access access) const {
+        VMManager::instance().touch(this);
         return static_cast<char*>(VMManager::instance().block_ptr(_page, _offset, access));
     }
 
@@ -1956,6 +2109,7 @@ private:
 
         const size_type new_cap = vm_detail::min_of(vm_detail::max_of(wanted, needed), max_size());
         VMManager& mgr = VMManager::instance();
+        if (!mgr.have_working_pages(has_block() ? 2 : 1)) return false; // old and new block
         uint16_t page = vm_detail::kNoPage;
         uint16_t offset = 0;
         size_t usable = 0;

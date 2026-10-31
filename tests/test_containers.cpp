@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <utility>
 #include <vector>
 #if VM_USE_STL
 #include <algorithm>
@@ -26,7 +28,7 @@ static int g_failures = 0;
     } while (0)
 
 /// Swap storage in RAM. Reading data that was never written is reported as an error.
-class RamStorage : public VMStorage {
+class RamStorage final : public VMStorage {
 public:
     bool fail_writes = false;
     int writes = 0;
@@ -61,7 +63,7 @@ static RamStorage* g_storage = nullptr;
 static int g_errors = 0;
 
 /// Records errors instead of aborting, so tests can check them.
-static void record_error(VMError) { g_errors++; }
+static void record_error(VMError e) { g_errors++; if (getenv("VM_TRACE_ERRORS")) std::printf("    error: %s\n", vm_error_name(e)); }
 
 static VMManager& vm() { return VMManager::instance(); }
 
@@ -399,7 +401,7 @@ static void test_storage_flushed_only_by_flush_all() {
 }
 
 /// Pages that can be pinned at once in this configuration.
-static const int PINNABLE = VM_RESIDENT_PAGES > 4 ? VM_RESIDENT_PAGES - 4 : 0;
+static const int PINNABLE = VM_RESIDENT_PAGES > VM_USER_PIN_RESERVE ? VM_RESIDENT_PAGES - VM_USER_PIN_RESERVE : 0;
 
 /// Read every page of v, evicting everything that is not pinned. Reads go
 /// through a const reference, so they never mark pages as possibly written.
@@ -519,6 +521,13 @@ static void test_pinned_nested_container_grows() {
 // Each operation must keep the page holding the container itself in RAM,
 // even with only the minimum number of resident pages.
 
+/// How many Person objects (with short names) fit `copies` times in virtual memory.
+static int people_that_fit(int wanted, int copies) {
+    const size_t per_person = sizeof(Person) + 16; // object plus its name block
+    const size_t fit = size_t(VM_PAGE_COUNT) * VM_PAGE_SIZE / (per_person * size_t(copies) * 2);
+    return int(vm_detail::min_of<size_t>(size_t(wanted), fit));
+}
+
 static void fill_people(VMVector<Person>& people, int n) {
     char name[16];
     for (int i = 0; i < n; ++i) {
@@ -528,23 +537,25 @@ static void fill_people(VMVector<Person>& people, int n) {
 }
 
 static void test_append_to_string_inside_vector() {
+    // As many people as comfortably fit in this configuration's virtual memory.
+    const int n = int(vm_detail::min_of<size_t>(60, VM_PAGE_COUNT * VM_PAGE_SIZE / (8 * sizeof(Person))));
     VMVector<Person> people;
-    fill_people(people, 60);
+    fill_people(people, n);
     VMVector<VMString> suffixes;
     char text[16];
-    for (int i = 0; i < 60; ++i) {
+    for (int i = 0; i < n; ++i) {
         std::snprintf(text, sizeof(text), "-s%d", i);
         suffixes.emplace_back(text);
     }
 
     // Each append reallocates the name while reading another VM string.
     for (int round = 0; round < 3; ++round)
-        for (int i = 0; i < 60; ++i) people[i].name.append(suffixes[59 - i]);
+        for (int i = 0; i < n; ++i) people[i].name.append(suffixes[n - 1 - i]);
 
     int wrong = 0;
-    for (int i = 0; i < 60; ++i) {
+    for (int i = 0; i < n; ++i) {
         char want[64];
-        std::snprintf(want, sizeof(want), "p%d-s%d-s%d-s%d", i, 59 - i, 59 - i, 59 - i);
+        std::snprintf(want, sizeof(want), "p%d-s%d-s%d-s%d", i, n - 1 - i, n - 1 - i, n - 1 - i);
         if (!(people[i].name == want) || people[i].age != i) wrong++;
     }
     CHECK(wrong == 0);
@@ -552,26 +563,31 @@ static void test_append_to_string_inside_vector() {
 }
 
 static void test_reserve_inside_vector_of_vectors() {
+    // Enough rows that the outer vector spans pages, within this configuration's memory.
+    const size_t memory = size_t(VM_PAGE_COUNT) * VM_PAGE_SIZE;
+    const int row_count = int(vm_detail::min_of<size_t>(60, memory / (4 * sizeof(VMVector<long>))));
+    const int target = row_count * 2 / 3;
     VMVector<VMVector<long> > rows;
-    for (int r = 0; r < 60; ++r) rows.emplace_back(); // the outer vector spans pages
+    for (int r = 0; r < row_count; ++r) rows.emplace_back();
     const long n = long(VM_PAGE_SIZE / sizeof(long)) * VM_RESIDENT_PAGES * 2;
 
-    rows[40].reserve(size_t(n)); // allocates many pages in one call
-    for (long i = 0; i < n; ++i) rows[40].push_back(i * 2);
+    rows[target].reserve(size_t(n)); // allocates many pages in one call
+    for (long i = 0; i < n; ++i) rows[target].push_back(i * 2);
 
     size_t wrong = 0;
     for (long i = 0; i < n; ++i)
-        if (rows[40][size_t(i)] != i * 2) wrong++;
+        if (rows[target][size_t(i)] != i * 2) wrong++;
     CHECK(wrong == 0);
-    CHECK(rows[40].size() == size_t(n));
-    for (int r = 0; r < 60; ++r)
-        if (r != 40) CHECK(rows[r].empty());
+    CHECK(rows[target].size() == size_t(n));
+    for (int r = 0; r < row_count; ++r)
+        if (r != target) CHECK(rows[r].empty());
     CHECK(g_errors == 0);
 }
 
 static void test_compare_strings_inside_vector() {
+    const int n = people_that_fit(40, 1);
     VMVector<Person> people;
-    fill_people(people, 40);
+    fill_people(people, n);
 
     // Selection sort by name, descending: compares names of two elements,
     // each in its own page, with their buffers in two more pages.
@@ -579,27 +595,30 @@ static void test_compare_strings_inside_vector() {
         for (size_t j = i + 1; j < people.size(); ++j)
             if (people[i].name < people[j].name) vm_detail::swap(people[i], people[j]);
 
-    CHECK(people[0].name == "p9");
-    CHECK(people[39].name == "p0");
     bool ordered = true;
     for (size_t i = 1; i < people.size(); ++i)
         if (people[i - 1].name < people[i].name) ordered = false;
     CHECK(ordered);
+    CHECK(people.back().name == "p0");
     CHECK(g_errors == 0);
 }
 
 static void test_copy_and_erase_objects_with_strings() {
+    const int n = people_that_fit(50, 2);
     VMVector<Person> people;
-    fill_people(people, 50);
+    fill_people(people, n);
 
     VMVector<Person> copy(people); // copies every name from virtual memory
     copy.erase(copy.begin());      // move-assigns every element one place down
-    copy.push_back(people[10]);    // copies an element of another VM vector
+    copy.push_back(people[n / 5]); // copies an element of another VM vector
 
-    CHECK(copy.size() == 50);
+    char want[16];
+    CHECK(copy.size() == size_t(n));
     CHECK(copy[0].name == "p1" && copy[0].age == 1);
-    CHECK(copy[48].name == "p49");
-    CHECK(copy[49].name == "p10" && copy[49].age == 10);
+    std::snprintf(want, sizeof(want), "p%d", n - 1);
+    CHECK(copy[size_t(n - 2)].name == want);
+    std::snprintf(want, sizeof(want), "p%d", n / 5);
+    CHECK(copy[size_t(n - 1)].name == want && copy[size_t(n - 1)].age == n / 5);
     CHECK(people[0].name == "p0"); // the original is untouched
     CHECK(g_errors == 0);
 }
@@ -626,11 +645,350 @@ static void test_three_levels_of_nesting() {
     CHECK(g_errors == 0);
 }
 
+struct Pair {
+    long a;
+    long b;
+    Pair(const long& x, const long& y) : a(x), b(y) {}
+};
+
+static void test_short_of_pages_reports_instead_of_corrupting() {
+    // Pins: the user's pin, the vector being changed (it lives in virtual
+    // memory) and both constructor arguments (each in a page of its own).
+    // That leaves one unpinned page, but growing the vector needs two, so
+    // growing must fail with TooManyPins and never move data incorrectly.
+    // Pins as the default VM_USER_PIN_RESERVE of 4 allows.
+    const int user_pin_count = VM_RESIDENT_PAGES - 4;
+    if (user_pin_count <= 0) return;
+    const size_t per_page = VM_PAGE_SIZE / sizeof(long);
+    VMVector<long> xs, ys, zs;
+    for (size_t i = 0; i < per_page * 2; ++i) {
+        xs.push_back(long(i));
+        ys.push_back(long(i) * 1000);
+    }
+    for (size_t i = 0; i < per_page * size_t(user_pin_count); ++i) zs.push_back(0);
+    // Enough rows that the outer vector is on whole pages, apart from the
+    // heap page that holds the inner vector's block.
+    const size_t row_count = VM_PAGE_SIZE / sizeof(VMVector<Pair>) + 2;
+    VMVector<VMVector<Pair> > rows;
+    for (size_t r = 0; r < row_count; ++r) rows.emplace_back();
+    const size_t target = row_count - 1;
+
+    // Use every pin the configuration allows, each on a page of its own.
+    std::vector<VMPin<long> > user_pins;
+    for (int p = 0; p < user_pin_count; ++p) {
+        user_pins.push_back(vm_pin(zs[size_t(p) * per_page]));
+        CHECK(user_pins.back().valid());
+    }
+
+    std::vector<std::pair<long, long> > model;
+    for (int k = 0; k < 40; ++k) {
+        const size_t i = per_page + size_t(k) % per_page; // second page of xs
+        const size_t before = rows[target].size();
+        rows[target].emplace_back(xs[i], ys[i]);
+        if (rows[target].size() > before) model.push_back(std::make_pair(long(i), long(i) * 1000));
+    }
+    user_pins.clear();
+
+    CHECK(vm().last_error() == VMError::TooManyPins); // the case was reached
+    CHECK(rows[target].size() == model.size());
+    size_t wrong = 0;
+    for (size_t k = 0; k < model.size(); ++k)
+        if (rows[target][k].a != model[k].first || rows[target][k].b != model[k].second) wrong++;
+    CHECK(wrong == 0);
+}
+
+#if VM_USER_PIN_RESERVE < 4
+// ---- Operations with too few unpinned pages ----
+// Built with a lower VM_USER_PIN_RESERVE, so the test can pin all pages but
+// `free_pages`. Each operation that copies between two pages must then
+// either work (two free) or report TooManyPins and change nothing (one free).
+
+/// Pins every resident page except `free_pages`, using pages of a filler vector.
+class PageHog {
+public:
+    explicit PageHog(int free_pages) {
+        const size_t per_page = VM_PAGE_SIZE / sizeof(long);
+        for (size_t i = 0; i < per_page * VM_RESIDENT_PAGES; ++i) _filler.push_back(0);
+        for (int p = 0; p < VM_RESIDENT_PAGES - free_pages; ++p) {
+            _pins.push_back(vm_pin(_filler[size_t(p) * per_page]));
+            CHECK(_pins.back().valid());
+        }
+    }
+
+private:
+    VMVector<long> _filler; // declared first: destroyed after the pins
+    std::vector<VMPin<long> > _pins;
+};
+
+static void make_paged(VMVector<long>& v, size_t pages, long base) {
+    for (size_t i = 0; i < pages * (VM_PAGE_SIZE / sizeof(long)); ++i) v.push_back(base + long(i));
+}
+
+static bool equals(const VMVector<long>& v, const std::vector<long>& model) {
+    if (v.size() != model.size()) return false;
+    for (size_t i = 0; i < model.size(); ++i) if (v[i] != model[i]) return false;
+    return true;
+}
+
+static std::vector<long> to_model(const VMVector<long>& v) {
+    std::vector<long> m;
+    for (size_t i = 0; i < v.size(); ++i) m.push_back(v[i]);
+    return m;
+}
+
+static void scarce_case(int free_pages, int which) {
+    reset_vm();
+    VMVector<long> a, b;
+    VMString text("a string with an existing block");
+    VMArray<long, 4> array;
+    array.fill(7);
+    switch (which) {
+        case 0: a.push_back(1); a.push_back(2); a.push_back(3); a.push_back(4); break; // flat, full
+        case 1: case 2: case 3: make_paged(a, 3, 0); make_paged(b, 3, 0); break;
+        default: break;
+    }
+    const std::vector<long> before = to_model(a);
+    const std::string text_before = text.c_str();
+
+    bool changed = false;
+    {
+        PageHog hog(free_pages);
+        g_errors = 0;
+        switch (which) {
+            case 0: { // grow the flat block, or move to whole pages
+                for (int k = 0; k < 40; ++k) a.push_back(100 + k);
+                changed = a.size() != before.size();
+                break;
+            }
+            case 1: a.erase(a.begin()); changed = a.size() != before.size(); break;
+            case 2: a.insert(a.begin(), -1); changed = a.size() != before.size(); break;
+            case 3: changed = (a == b); break;
+            case 4: text.append(" and a lot more text so that it needs a larger block"); changed = text.size() != text_before.size(); break;
+            default: { VMArray<long, 4> copy(array); changed = copy[0] == 7; break; }
+        }
+    }
+
+    if (free_pages >= 2) {
+        CHECK(changed);
+        CHECK(g_errors == 0);
+    } else {
+        // Not enough pages: the error is reported and nothing is modified.
+        CHECK(vm().last_error() == VMError::TooManyPins);
+        if (which <= 2) CHECK(equals(a, before));
+        if (which == 4) CHECK(text_before == text.c_str());
+    }
+}
+
+static void test_too_few_unpinned_pages() {
+    for (int which = 0; which <= 5; ++which) {
+        scarce_case(1, which);
+        scarce_case(2, which);
+    }
+}
+#endif
+
 static void test_pin_outside_virtual_memory() {
     int local = 5;
     VMPin<int> p(local);
     CHECK(!p.valid());
     CHECK(*p == 5);
+    CHECK(g_errors == 0);
+}
+
+// ---- Model-based stress tests ----
+// Random operations on VMVectors and on std::vectors side by side; after
+// every operation the contents must match exactly. Elements are checked in
+// forward, backward and random order to exercise every way of finding a page.
+
+struct Rng {
+    uint32_t state;
+    explicit Rng(uint32_t seed) : state(seed) {}
+    uint32_t next() { state = state * 1664525u + 1013904223u; return state >> 8; }
+    size_t below(size_t n) { return n ? size_t(next() % n) : 0; }
+};
+
+/// Element counts that keep two vectors well within the virtual memory.
+static size_t stress_capacity(size_t element_size) {
+    const size_t per_page = VM_PAGE_SIZE / element_size;
+    const size_t limit = VM_PAGE_COUNT * per_page / 5;
+    return limit < 600 ? limit : 600;
+}
+
+template<typename T, typename Value>
+static bool same_contents(const VMVector<T>& vm, const std::vector<Value>& model, Rng& rng, Value (*value_of)(const T&)) {
+    if (vm.size() != model.size()) return false;
+    const size_t n = model.size();
+    switch (rng.below(3)) {
+        case 0:
+            for (size_t i = 0; i < n; ++i) if (value_of(vm[i]) != model[i]) return false;
+            break;
+        case 1:
+            for (size_t i = n; i-- > 0;) if (value_of(vm[i]) != model[i]) return false;
+            break;
+        default:
+            for (size_t k = 0; k < n; ++k) {
+                const size_t i = rng.below(n);
+                if (value_of(vm[i]) != model[i]) return false;
+            }
+    }
+    return true;
+}
+
+static long long_value(const long& x) { return x; }
+static int tracked_value(const Tracked& t) { return t.value; }
+
+/// One random operation on (v, model), with `other` / `other_model` as a second pair.
+template<typename T, typename Value>
+static void random_operation(Rng& rng, size_t cap, VMVector<T>& v, std::vector<Value>& model,
+                             VMVector<T>& other, std::vector<Value>& other_model) {
+    const Value x = Value(rng.below(100000));
+    const size_t n = model.size();
+    switch (rng.below(16)) {
+        case 0: case 1: case 2: case 3:
+            if (n < cap) { v.push_back(T(x)); model.push_back(x); }
+            break;
+        case 4: case 5:
+            if (n > 0) { v.pop_back(); model.pop_back(); }
+            break;
+        case 6:
+            if (n < cap) {
+                const size_t at = rng.below(n + 1);
+                v.insert(v.begin() + at, T(x));
+                model.insert(model.begin() + at, x);
+            }
+            break;
+        case 7:
+            if (n > 0) {
+                const size_t at = rng.below(n);
+                v.erase(v.begin() + at);
+                model.erase(model.begin() + at);
+            }
+            break;
+        case 8:
+            if (n > 0) {
+                const size_t at = rng.below(n);
+                v[at] = T(x);
+                model[at] = x;
+            }
+            break;
+        case 9: {
+            const size_t to = rng.below(cap + 1);
+            v.resize(to, T(x));
+            model.resize(to, x);
+            break;
+        }
+        case 10:
+            v.reserve(rng.below(cap + 1));
+            break;
+        case 11:
+            v.shrink_to_fit();
+            break;
+        case 12:
+            if (rng.below(4) == 0) { v.clear(); model.clear(); }
+            break;
+        case 13:
+            v.swap(other);
+            model.swap(other_model);
+            break;
+        case 14:
+            if (rng.below(2) == 0) { v = other; model = other_model; }
+            else { other = v; other_model = model; }
+            break;
+        default: {
+            const size_t count = rng.below(cap / 2 + 1);
+            v.assign(count, T(x));
+            model.assign(count, x);
+        }
+    }
+}
+
+static void test_stress_vector_of_longs() {
+    const size_t cap = stress_capacity(sizeof(long));
+    for (uint32_t seed = 1; seed <= 4; ++seed) {
+        Rng rng(seed);
+        VMVector<long> a, b;
+        std::vector<long> ma, mb;
+        int mismatches = 0;
+        for (int step = 0; step < 2500 && mismatches == 0; ++step) {
+            if (rng.below(2)) random_operation(rng, cap, a, ma, b, mb);
+            else random_operation(rng, cap, b, mb, a, ma);
+            if (!same_contents(a, ma, rng, long_value) || !same_contents(b, mb, rng, long_value)) {
+                std::printf("  seed %u: mismatch after step %d\n", seed, step);
+                mismatches++;
+            }
+        }
+        CHECK(mismatches == 0);
+    }
+    CHECK(used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_stress_vector_of_objects() {
+    const size_t cap = stress_capacity(sizeof(Tracked));
+    for (uint32_t seed = 11; seed <= 13; ++seed) {
+        Rng rng(seed);
+        {
+            VMVector<Tracked> a, b;
+            std::vector<int> ma, mb;
+            int mismatches = 0;
+            for (int step = 0; step < 2000 && mismatches == 0; ++step) {
+                if (rng.below(2)) random_operation(rng, cap, a, ma, b, mb);
+                else random_operation(rng, cap, b, mb, a, ma);
+                if (!same_contents(a, ma, rng, tracked_value) || !same_contents(b, mb, rng, tracked_value)) {
+                    std::printf("  seed %u: mismatch after step %d\n", seed, step);
+                    mismatches++;
+                }
+                // Every element alive in a VMVector is counted exactly once.
+                if (Tracked::live != int(ma.size() + mb.size())) {
+                    std::printf("  seed %u: %d live objects, expected %d\n", seed, Tracked::live, int(ma.size() + mb.size()));
+                    mismatches++;
+                }
+            }
+            CHECK(mismatches == 0);
+        }
+        CHECK(Tracked::live == 0);
+    }
+    CHECK(used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_stress_vectors_inside_virtual_memory() {
+    // The vectors themselves live in a VMVector, so their fields (including
+    // the cached chunk) are in pages that are swapped in and out.
+    const int kRows = 4;
+    const size_t cap = stress_capacity(sizeof(long)) / kRows * 2;
+    Rng rng(99);
+    {
+        VMVector<VMVector<long> > rows;
+        for (int r = 0; r < kRows; ++r) rows.emplace_back();
+        std::vector<std::vector<long> > models(kRows);
+        const VMVector<VMVector<long> >& const_rows = rows;
+
+        int mismatches = 0;
+        for (int step = 0; step < 3000 && mismatches == 0; ++step) {
+            const int r = int(rng.below(kRows));
+            const int o = (r + 1 + int(rng.below(kRows - 1))) % kRows;
+            if (rng.below(3) == 0) {
+                // Read through a const reference: the row's page is only read.
+                const VMVector<long>& row = const_rows[r];
+                const size_t n = models[r].size();
+                for (size_t k = 0; k < 4 && n > 0; ++k) {
+                    const size_t i = rng.below(n);
+                    if (const_rows[r][i] != models[r][i]) mismatches++;
+                }
+                if (row.size() != n) mismatches++;
+            } else {
+                random_operation(rng, cap, rows[r], models[r], rows[o], models[o]);
+            }
+            for (int k = 0; k < kRows; ++k)
+                if (!same_contents(const_rows[k], models[k], rng, long_value)) {
+                    std::printf("  row %d: mismatch after step %d\n", k, step);
+                    mismatches++;
+                }
+        }
+        CHECK(mismatches == 0);
+    }
+    CHECK(used_pages() == 0);
     CHECK(g_errors == 0);
 }
 
@@ -720,6 +1078,13 @@ int main() {
         {"compare strings inside vector", test_compare_strings_inside_vector},
         {"copy and erase objects with strings", test_copy_and_erase_objects_with_strings},
         {"three levels of nesting", test_three_levels_of_nesting},
+        {"short of pages reports instead of corrupting", test_short_of_pages_reports_instead_of_corrupting},
+#if VM_USER_PIN_RESERVE < 4
+        {"too few unpinned pages", test_too_few_unpinned_pages},
+#endif
+        {"stress: vector of longs", test_stress_vector_of_longs},
+        {"stress: vector of objects", test_stress_vector_of_objects},
+        {"stress: vectors inside virtual memory", test_stress_vectors_inside_virtual_memory},
 #if VM_USE_STL
         {"STL algorithms", test_stl_algorithms},
         {"sort objects with strings", test_sort_objects_with_strings},

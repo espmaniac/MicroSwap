@@ -40,5 +40,7 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - Writes made after `flush_all()` through earlier references could be lost.
 - Changing a container stored inside virtual memory (`people[i].name.append(...)`, `rows[i].reserve(n)`) could crash or corrupt data when the operation loaded other pages. Each operation now keeps the pages of the container and of its arguments in RAM.
 - `v.assign(4, 1)` chose the iterator-range overload and did not compile.
+- `v.push_back(v[0])` (or `emplace_back`, `insert`) on a vector that had to grow copied the element after it had been moved.
+- `find_first_of` and the related searches matched a `'\0'` inside the string against any character set.
 - Using an inner container through a reference (`const auto& row = rows[i]; ... row[j]`) could read its fields after its page had been evicted.
 - Copying one inner container to another (`rows[3] = rows[1]`) could fill the copy with zeros when too few pages were free, without reporting an error. Copies now reserve space first, and every step that needs two pages at once checks that they are available.

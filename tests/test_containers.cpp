@@ -195,6 +195,39 @@ static void test_pop_back_releases_pages() {
     CHECK(used_pages() < full);
 }
 
+static void test_push_back_of_own_element() {
+    // Growing a flat vector moves its elements; the argument is one of them.
+    VMVector<int> numbers;
+    numbers.push_back(42);
+    int wrong = 0;
+    for (int i = 0; i < 60; ++i) {
+        numbers.push_back(numbers[0]);
+        if (numbers.back() != 42) wrong++;
+    }
+    CHECK(wrong == 0);
+
+    VMVector<VMString> strings;
+    strings.emplace_back("first element");
+    wrong = 0;
+    for (int i = 0; i < 40; ++i) {
+        if (i % 2) strings.push_back(strings[0]);
+        else strings.emplace_back(strings[0]);
+        if (!(strings.back() == "first element")) wrong++;
+    }
+    CHECK(wrong == 0);
+    CHECK(strings[0] == "first element");
+
+    // insert() builds the element at the end first, then moves it into place.
+    VMVector<VMString> words;
+    words.emplace_back("a");
+    for (int i = 0; i < 20; ++i) words.insert(words.begin(), words[words.size() - 1]);
+    wrong = 0;
+    for (size_t i = 0; i < words.size(); ++i)
+        if (!(words[i] == "a")) wrong++;
+    CHECK(wrong == 0);
+    CHECK(g_errors == 0);
+}
+
 static void test_insert_and_erase() {
     VMVector<int> v;
     for (int i = 0; i < 5; ++i) v.push_back(i);        // 0 1 2 3 4
@@ -319,6 +352,19 @@ static void test_vmstring_operations() {
     VMString t = s + "!";
     CHECK(t == "[world]!");
     CHECK(t.compare("[world]") > 0);
+}
+
+static void test_vmstring_embedded_nul() {
+    // '\0' inside the string is a character like any other, and never part
+    // of a character set given as a C string.
+    VMString s("ab");
+    s.resize(4); // "ab\0\0"
+    CHECK(s.size() == 4);
+    CHECK(s.find_first_of("xyz") == VMString::npos);
+    CHECK(s.find_last_of("xyz") == VMString::npos);
+    CHECK(s.find_first_not_of("ab") == 2);
+    CHECK(s.find_last_not_of("xyz") == 3);
+    CHECK(s.find_first_of("b") == 1);
 }
 
 static void test_vmstring_append_self() {
@@ -1087,6 +1133,7 @@ int main() {
         {"small vector stays flat", test_small_vector_stays_flat},
         {"pop_back across chunk boundary", test_pop_back_across_chunk_boundary},
         {"pop_back releases pages", test_pop_back_releases_pages},
+        {"push_back of own element", test_push_back_of_own_element},
         {"insert and erase", test_insert_and_erase},
         {"swap and move", test_swap_and_move},
         {"copy vector", test_copy_vector},
@@ -1096,6 +1143,7 @@ int main() {
         {"vector of objects with strings", test_vector_of_objects_with_strings},
         {"heap does not fragment", test_heap_does_not_fragment},
         {"VMString operations", test_vmstring_operations},
+        {"VMString embedded NUL", test_vmstring_embedded_nul},
         {"VMString append self", test_vmstring_append_self},
         {"VMString too long", test_vmstring_too_long},
         {"empty string uses no memory", test_empty_string_uses_no_memory},

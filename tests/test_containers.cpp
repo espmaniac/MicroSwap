@@ -390,6 +390,112 @@ static void test_storage_flushed_only_by_flush_all() {
     CHECK(g_storage->flushes == 1);
 }
 
+/// Pages that can be pinned at once in this configuration.
+static const int PINNABLE = VM_RESIDENT_PAGES > 3 ? VM_RESIDENT_PAGES - 3 : 0;
+
+/// Read every page of v, evicting everything that is not pinned. Reads go
+/// through a const reference, so they never mark pages as possibly written.
+static long long touch_all(const VMVector<int>& v) {
+    long long sum = 0;
+    for (size_t i = 0; i < v.size(); ++i) sum += v[i];
+    return sum;
+}
+
+static void test_pin_keeps_reference_valid() {
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3); ++i) v.push_back(int(i));
+
+    VMPin<int> first(v[0]);
+    if (PINNABLE == 0) {
+        CHECK(!first.valid());
+        CHECK(vm().last_error() == VMError::TooManyPins);
+        return;
+    }
+    CHECK(first.valid());
+
+    touch_all(v);
+    CHECK(*first == 0);
+    const uint32_t loads = vm().swap_in_count();
+    CHECK(&*first == &v[0]);                 // same RAM address...
+    CHECK(vm().swap_in_count() == loads);    // ...and the page was not reloaded
+    *first = 12345;
+
+    first.release();
+    touch_all(v);
+    CHECK(v[0] == 12345);
+    CHECK(g_errors == 0);
+}
+
+static void test_write_after_flush_is_saved() {
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3); ++i) v.push_back(int(i));
+
+    int& ref = v[0];
+    vm().flush_all();
+    ref = 777; // written after the page was saved
+    touch_all(v);
+    CHECK(v[0] == 777);
+}
+
+static void test_too_many_pins() {
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES + 2); ++i) v.push_back(int(i));
+
+    std::vector<VMPin<int>> pins;
+    int pinned = 0;
+    for (int p = 0; p < VM_RESIDENT_PAGES; ++p) {
+        pins.push_back(vm_pin(v[p * INTS_PER_PAGE]));
+        if (pins.back().valid()) pinned++;
+    }
+    CHECK(pinned == PINNABLE);
+    CHECK(vm().last_error() == VMError::TooManyPins);
+
+    // A second pin on an already pinned page is always allowed.
+    if (PINNABLE > 0) {
+        VMPin<int> again(v[0]);
+        CHECK(again.valid());
+    }
+
+    // With pins held, the containers still have room to work.
+    vm().clear_error();
+    g_errors = 0;
+    CHECK(touch_all(v) > 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_pin_string_and_ptr() {
+    if (PINNABLE == 0) return;
+    VMString s("hello pinned world");
+    VMPtr<Person> person = make_vm<Person>(30, "alice");
+
+    VMVector<int> filler;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3); ++i) filler.push_back(int(i));
+
+    {
+        auto text = vm_pin(s.c_str());
+        CHECK(text.valid());
+        touch_all(filler);
+        CHECK(strcmp(text.get(), "hello pinned world") == 0);
+    }
+    {
+        VMPin<Person> p(*person);
+        CHECK(p.valid());
+        touch_all(filler);
+        p->age++;
+    }
+    touch_all(filler);
+    CHECK(person->age == 31);
+    person.destroy();
+}
+
+static void test_pin_outside_virtual_memory() {
+    int local = 5;
+    VMPin<int> p(local);
+    CHECK(!p.valid());
+    CHECK(*p == 5);
+    CHECK(g_errors == 0);
+}
+
 #if VM_USE_STL
 static void test_stl_algorithms() {
     // Enough elements to span more pages than fit in RAM.
@@ -465,6 +571,11 @@ int main() {
         {"writes through references are saved", test_writes_through_references_are_saved},
         {"references survive counter overflow", test_references_survive_counter_overflow},
         {"storage flushed only by flush_all", test_storage_flushed_only_by_flush_all},
+        {"pin keeps reference valid", test_pin_keeps_reference_valid},
+        {"write after flush is saved", test_write_after_flush_is_saved},
+        {"too many pins", test_too_many_pins},
+        {"pin string and ptr", test_pin_string_and_ptr},
+        {"pin outside virtual memory", test_pin_outside_virtual_memory},
 #if VM_USE_STL
         {"STL algorithms", test_stl_algorithms},
         {"sort objects with strings", test_sort_objects_with_strings},

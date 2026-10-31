@@ -34,19 +34,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Placement new. AVR cores ship <new> since 1.8.3 and <new.h> before that.
+// Placement new. Most cores ship <new>; older AVR cores only <new.h>. The
+// megaAVR core's <new.h> lacks placement new, and the SAM (Due) toolchain
+// has neither header, so it is defined here for those two.
 #if defined(__has_include)
 #  if __has_include(<new>)
 #    include <new>
-#  else
+#    define VM_HAS_STD_NEW 1
+#  elif __has_include(<new.h>)
 #    include <new.h>
-#    if defined(ARDUINO_ARCH_MEGAAVR)
-// The megaAVR core's <new.h> has no placement new.
-inline void* operator new(size_t, void* place) noexcept { return place; }
-#    endif
 #  endif
 #else
 #  include <new>
+#  define VM_HAS_STD_NEW 1
+#endif
+#if !defined(VM_HAS_STD_NEW) && (defined(ARDUINO_ARCH_MEGAAVR) || defined(ARDUINO_ARCH_SAM))
+inline void* operator new(size_t, void* place) noexcept { return place; }
 #endif
 
 // -----------------------------------------------------------------------------

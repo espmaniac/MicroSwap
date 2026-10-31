@@ -1,46 +1,71 @@
-// Host-side tests for containers.h. Build and run with `make -C tests`.
+// Host-side tests for MicroSwap.h. Build and run with `make -C tests`.
+//
+// The Makefile builds this file twice: with the default configuration, and
+// with an AVR-like one (C++11, no STL, tiny pages) where pages are swapped
+// out all the time.
 
-#include <FS.h>
-#include <algorithm>
+#include "../src/MicroSwap.h"
+
 #include <cstdio>
 #include <cstdlib>
-#include <initializer_list>
-#include <limits>
-#include <new>
-#include <stdexcept>
-#include <type_traits>
-#include <utility>
-
-// Tests inspect the page table, which VMManager keeps private.
-// Every header containers.h needs is included above, so the macro
-// only affects containers.h itself.
-#define private public
-#include "../containers.h"
-#undef private
+#include <cstring>
+#include <vector>
+#if VM_USE_STL
+#include <algorithm>
+#include <numeric>
+#endif
 
 static int g_failures = 0;
 
-#define CHECK(cond)                                                        \
-    do {                                                                   \
-        if (!(cond)) {                                                     \
+#define CHECK(cond)                                                         \
+    do {                                                                    \
+        if (!(cond)) {                                                      \
             std::printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-            g_failures++;                                                  \
-        }                                                                  \
+            g_failures++;                                                   \
+        }                                                                   \
     } while (0)
 
-static fs::FS g_fs;
+/// Swap storage in RAM. Reading data that was never written is reported as an error.
+class RamStorage : public VMStorage {
+public:
+    bool fail_writes = false;
+
+    bool read(uint32_t offset, uint8_t* buf, size_t len) override {
+        if (offset + len > _data.size()) return false;
+        memcpy(buf, &_data[offset], len);
+        return true;
+    }
+
+    bool write(uint32_t offset, const uint8_t* buf, size_t len) override {
+        if (fail_writes) return false;
+        // Like many file systems, refuse to write past the end of the file.
+        if (offset > _data.size()) return false;
+        if (offset + len > _data.size()) _data.resize(offset + len);
+        memcpy(&_data[offset], buf, len);
+        return true;
+    }
+
+private:
+    std::vector<uint8_t> _data;
+};
+
+static RamStorage* g_storage = nullptr;
+static int g_errors = 0;
+
+/// Records errors instead of aborting, so tests can check them.
+static void record_error(VMError) { g_errors++; }
+
+static VMManager& vm() { return VMManager::instance(); }
 
 static void reset_vm() {
-    VMManager::instance().end();
-    VMManager::instance().begin(g_fs, "/.swap");
+    delete g_storage;
+    g_storage = new RamStorage();
+    vm().begin(*g_storage);
+    vm().set_error_handler(record_error);
+    g_errors = 0;
 }
 
-static int allocated_pages() {
-    int count = 0;
-    for (const VMPage& pg : VMManager::instance().pages)
-        if (pg.allocated) count++;
-    return count;
-}
+static size_t used_pages() { return vm().get_page_count() - vm().free_pages(); }
 
 static const size_t INTS_PER_PAGE = VM_PAGE_SIZE / sizeof(int);
 
@@ -52,103 +77,156 @@ struct Tracked {
     Tracked(const Tracked& o) : value(o.value) { live++; }
     Tracked(Tracked&& o) noexcept : value(o.value) { live++; }
     Tracked& operator=(const Tracked&) = default;
+    Tracked& operator=(Tracked&&) = default;
     ~Tracked() { live--; }
 };
 int Tracked::live = 0;
 
-static void test_reserve_then_push_back() {
-    VMVector<int> v;
-    v.reserve(2048);
-    for (int i = 0; i < 2048; ++i) v.push_back(i);
+/// Object with a VMString member, like the README example.
+struct Person {
+    int age;
+    VMString name;
+    Person() : age(0) {}
+    Person(int a, const char* n) : age(a), name(n) {}
+};
 
-    int wrong = 0;
-    for (int i = 0; i < 2048; ++i)
-        if (v[i] != i) wrong++;
+// -----------------------------------------------------------------------------
+
+static void test_data_survives_swapping() {
+    // Several times more data than fits in RAM.
+    const size_t n = INTS_PER_PAGE * (VM_RESIDENT_PAGES * 4);
+    VMVector<int> v;
+    for (size_t i = 0; i < n; ++i) v.push_back(int(i * 7));
+
+    size_t wrong = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (v[i] != int(i * 7)) wrong++;
     CHECK(wrong == 0);
-    CHECK(v.size() == 2048);
+    CHECK(vm().swap_out_count() > 0);
+    CHECK(vm().swap_in_count() > 0);
+    CHECK(g_errors == 0);
 }
 
-static void test_reserve_keeps_flat_mode_when_it_fits() {
+static void test_reserve_then_push_back() {
+    const size_t n = INTS_PER_PAGE * 2;
     VMVector<int> v;
-    v.reserve(100);
+    v.reserve(n);
+    for (size_t i = 0; i < n; ++i) v.push_back(int(i));
+
+    size_t wrong = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (v[i] != int(i)) wrong++;
+    CHECK(wrong == 0);
+}
+
+static void test_small_vector_stays_flat() {
+    VMVector<int> v;
+    v.reserve(4);
+    for (int i = 0; i < 4; ++i) v.push_back(i);
     CHECK(v.is_flat());
-    CHECK(v.capacity() >= 100);
-    for (int i = 0; i < 100; ++i) v.push_back(i);
-    CHECK(v.is_flat());
-    CHECK(v.back() == 99);
+    CHECK(v.data() != nullptr);
+    CHECK(v.back() == 3);
 }
 
 static void test_pop_back_across_chunk_boundary() {
     VMVector<int> v;
-    for (size_t i = 0; i < INTS_PER_PAGE + 1; ++i) v.push_back((int)i);
+    for (size_t i = 0; i < INTS_PER_PAGE + 1; ++i) v.push_back(int(i));
 
     v.pop_back();
     CHECK(v.size() == INTS_PER_PAGE);
-    CHECK(v.back() == (int)INTS_PER_PAGE - 1);
+    CHECK(v.back() == int(INTS_PER_PAGE) - 1);
 
     v.push_back(777);
     CHECK(v[INTS_PER_PAGE] == 777);
-    CHECK(v[INTS_PER_PAGE - 1] == (int)INTS_PER_PAGE - 1);
 }
 
 static void test_pop_back_releases_pages() {
     VMVector<int> v;
-    for (size_t i = 0; i < 3 * INTS_PER_PAGE; ++i) v.push_back((int)i);
-    const int pages_full = allocated_pages();
+    for (size_t i = 0; i < 3 * INTS_PER_PAGE; ++i) v.push_back(int(i));
+    const size_t full = used_pages();
 
     while (!v.empty()) v.pop_back();
-    CHECK(allocated_pages() < pages_full);
+    CHECK(used_pages() < full);
 }
 
-static void test_swap_flat_vectors() {
-    VMVector<int> a{1, 2, 3};
-    VMVector<int> b{9};
-    a.swap(b);
-
-    CHECK(a.size() == 1 && a[0] == 9);
-    CHECK(b.size() == 3 && b[0] == 1 && b[2] == 3);
+static void test_insert_and_erase() {
+    VMVector<int> v;
+    for (int i = 0; i < 5; ++i) v.push_back(i);        // 0 1 2 3 4
+    v.insert(v.begin() + 2, 99);                         // 0 1 99 2 3 4
+    v.erase(v.begin());                                  // 1 99 2 3 4
+    CHECK(v.size() == 5);
+    CHECK(v[0] == 1 && v[1] == 99 && v[2] == 2 && v[4] == 4);
 }
 
-static void test_swap_flat_with_paged() {
-    VMVector<int> small{5};
+static void test_swap_and_move() {
+    VMVector<int> small;
+    small.push_back(5);
     VMVector<int> big;
-    for (size_t i = 0; i < 2 * INTS_PER_PAGE; ++i) big.push_back((int)i);
+    for (size_t i = 0; i < 2 * INTS_PER_PAGE; ++i) big.push_back(int(i));
 
     small.swap(big);
     CHECK(big.size() == 1 && big[0] == 5);
-    CHECK(small.size() == 2 * INTS_PER_PAGE && small.back() == (int)(2 * INTS_PER_PAGE - 1));
+    CHECK(small.size() == 2 * INTS_PER_PAGE && small.back() == int(2 * INTS_PER_PAGE - 1));
+
+    VMVector<int> moved(vm_detail::move(small));
+    CHECK(small.empty());
+    CHECK(moved.size() == 2 * INTS_PER_PAGE);
 }
 
-static void test_out_of_pages_throws() {
+static void test_copy_vector() {
+    VMVector<int> a;
+    for (int i = 0; i < 10; ++i) a.push_back(i);
+    VMVector<int> b(a);
+    b[0] = 42;
+    CHECK(a[0] == 0 && b[0] == 42);
+    CHECK(b.size() == 10 && b[9] == 9);
+}
+
+static void test_out_of_pages_reports_error() {
     VMVector<int> v;
-    bool threw = false;
-    try {
-        for (size_t i = 0; i < (VM_PAGE_COUNT + 1) * INTS_PER_PAGE; ++i) v.push_back((int)i);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    CHECK(threw);
+    const size_t too_many = (VM_PAGE_COUNT + 1) * INTS_PER_PAGE;
+    for (size_t i = 0; i < too_many && g_errors == 0; ++i) v.push_back(int(i));
+
+    CHECK(g_errors > 0);
+    CHECK(vm().last_error() == VMError::OutOfPages);
+    CHECK(v.size() < too_many);
+    CHECK(v[0] == 0); // existing elements are intact
+}
+
+static void test_out_of_range_reports_error() {
+    VMVector<int> v;
+    v.at(3);
+    CHECK(vm().last_error() == VMError::OutOfRange);
 }
 
 static void test_no_leaks_for_non_trivial_elements() {
     {
         VMVector<Tracked> v;
-        // Enough elements to grow the flat block several times and go paged.
-        for (int i = 0; i < 2000; ++i) v.emplace_back(i);
-        CHECK(Tracked::live == 2000);
-        CHECK(v[1999].value == 1999);
+        // Grows the flat block several times, then goes paged.
+        const int n = int(INTS_PER_PAGE * 3);
+        for (int i = 0; i < n; ++i) v.emplace_back(i);
+        CHECK(Tracked::live == n);
+        CHECK(v[n - 1].value == n - 1);
 
         v.pop_back();
-        CHECK(Tracked::live == 1999);
+        CHECK(Tracked::live == n - 1);
     }
     CHECK(Tracked::live == 0);
+    CHECK(used_pages() == 0);
 }
 
-static void test_clear_after_pop_frees_flat_block() {
-    VMVector<int> v{1, 2, 3};
-    while (!v.empty()) v.pop_back();
-    v.clear();
-    CHECK(allocated_pages() == 0);
+static void test_vector_of_objects_with_strings() {
+    {
+        VMVector<Person> people;
+        for (int i = 0; i < 40; ++i) {
+            char name[16];
+            std::snprintf(name, sizeof(name), "person-%d", i);
+            people.emplace_back(i, name);
+        }
+        CHECK(people[17].name == "person-17");
+        CHECK(people[39].age == 39);
+    }
+    CHECK(used_pages() == 0);
 }
 
 static void test_heap_does_not_fragment() {
@@ -156,38 +234,179 @@ static void test_heap_does_not_fragment() {
     // the heap would eat every page.
     for (int round = 0; round < 300; ++round) {
         VMString s;
-        for (int k = 0; k < round * 10 % 4000; ++k) s.push_back('x');
+        const int len = (round * 7) % int(VMString::max_size());
+        for (int k = 0; k < len; ++k) s.push_back('x');
     }
-    CHECK(allocated_pages() == 0);
+    CHECK(used_pages() == 0);
+    CHECK(g_errors == 0);
 }
 
-static void test_vmstring_basics() {
+static void test_vmstring_operations() {
     VMString s("hello");
     s.append(" world");
-    CHECK(s.compare("hello world") == 0);
+    CHECK(s == "hello world");
+
     s.replace(0, 5, "HELLO");
-    CHECK(s == VMString("HELLO world"));
+    CHECK(s == "HELLO world");
+
+    s.insert(0, "[");
+    s += ']';
+    CHECK(s == "[HELLO world]");
+
+    s.erase(1, 6);
+    CHECK(s == "[world]");
+    CHECK(s.find("orl") == 2);
+    CHECK(s.rfind('o') == 2);
+    CHECK(s.find('z') == VMString::npos);
+    CHECK(s.find_first_of("dlr") == 3);
+    CHECK(s.find_last_not_of("]") == 5);
+    CHECK(s.substr(1, 5) == "world");
+
+    VMString t = s + "!";
+    CHECK(t == "[world]!");
+    CHECK(t.compare("[world]") > 0);
 }
+
+static void test_vmstring_append_self() {
+    VMString s("abc");
+    s.append(s);
+    CHECK(s == "abcabc");
+    s.insert(1, s.c_str() + 4);
+    CHECK(s == "abcbcabc");
+}
+
+static void test_vmstring_too_long() {
+    VMString s;
+    s.resize(VMString::max_size() + 1, 'x');
+    CHECK(vm().last_error() == VMError::TooLarge);
+    CHECK(s.empty());
+}
+
+static void test_empty_string_uses_no_memory() {
+    VMString s;
+    CHECK(s.c_str()[0] == '\0');
+    CHECK(used_pages() == 0);
+}
+
+static void test_vmarray() {
+    VMArray<int, 8> a;
+    CHECK(used_pages() == 0); // allocated on first access
+    CHECK(a[3] == 0);         // value-initialized
+    for (size_t i = 0; i < a.size(); ++i) a[i] = int(i * i);
+
+    VMArray<int, 8> b(a);
+    b[2] = -1;
+    CHECK(a[2] == 4 && b[2] == -1 && b[7] == 49);
+
+    VMArray<Tracked, 4>* objects = new VMArray<Tracked, 4>();
+    (*objects)[0].value = 1;
+    CHECK(Tracked::live == 4);
+    delete objects;
+    CHECK(Tracked::live == 0);
+}
+
+static void test_vmptr() {
+    VMPtr<Person> p = make_vm<Person>(28, "oscar");
+    CHECK(p.valid());
+    CHECK(p->age == 28 && p->name == "oscar");
+    p->age++;
+    CHECK((*p).age == 29);
+    p.destroy();
+    CHECK(!p.valid());
+    CHECK(used_pages() == 0);
+
+    VMPtr<int> null_ptr;
+    *null_ptr = 1;
+    CHECK(vm().last_error() == VMError::NullPointer);
+}
+
+static void test_storage_write_failure_reports_error() {
+    VMVector<int> v;
+    g_storage->fail_writes = true;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES + 1); ++i) v.push_back(int(i));
+    CHECK(vm().last_error() == VMError::StorageIO);
+    g_storage->fail_writes = false;
+}
+
+#if VM_USE_STL
+static void test_stl_algorithms() {
+    // Enough elements to span more pages than fit in RAM.
+    const int n = int(INTS_PER_PAGE * (VM_RESIDENT_PAGES + 2));
+    VMVector<int> v;
+    for (int i = 0; i < n; ++i) v.push_back((i * 7919) % n);
+
+    std::sort(v.begin(), v.end());
+    CHECK(std::is_sorted(v.begin(), v.end()));
+    CHECK(std::accumulate(v.begin(), v.end(), 0LL) == (long long)n * (n - 1) / 2);
+
+    std::reverse(v.begin(), v.end());
+    CHECK(v.front() == n - 1);
+    CHECK(std::find(v.begin(), v.end(), 5).pos() == size_t(n - 1 - 5));
+}
+
+static void test_sort_objects_with_strings() {
+    VMVector<Person> people;
+    const char* names[] = {"dave", "alice", "erin", "bob", "carol"};
+    for (int round = 0; round < 20; ++round)
+        for (int i = 0; i < 5; ++i) people.emplace_back(round * 5 + i, names[i]);
+
+    std::sort(people.begin(), people.end(), [](const Person& a, const Person& b) {
+        return a.name < b.name || (a.name == b.name && a.age < b.age);
+    });
+    CHECK(people.front().name == "alice");
+    CHECK(people.back().name == "erin");
+
+    bool ordered = true;
+    for (size_t i = 1; i < people.size(); ++i)
+        if (people[i].name < people[i - 1].name) ordered = false;
+    CHECK(ordered);
+}
+
+static void test_string_algorithms() {
+    VMString s("the quick brown fox");
+    std::replace(s.begin(), s.end(), ' ', '_');
+    std::transform(s.begin(), s.end(), s.begin(), [](char c) { return char(c >= 'a' && c <= 'z' ? c - 32 : c); });
+    CHECK(s == "THE_QUICK_BROWN_FOX");
+    CHECK(std::count(s.begin(), s.end(), '_') == 3);
+}
+#endif
 
 int main() {
     // Unbuffered output shows which test was running if one crashes.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("Config: page=%d resident=%d pages=%d stl=%d\n\n",
+                VM_PAGE_SIZE, VM_RESIDENT_PAGES, VM_PAGE_COUNT, VM_USE_STL);
 
-    struct { const char* name; void (*fn)(); } tests[] = {
+    struct Test { const char* name; void (*fn)(); };
+    const Test tests[] = {
+        {"data survives swapping", test_data_survives_swapping},
         {"reserve then push_back", test_reserve_then_push_back},
-        {"reserve keeps flat mode when it fits", test_reserve_keeps_flat_mode_when_it_fits},
+        {"small vector stays flat", test_small_vector_stays_flat},
         {"pop_back across chunk boundary", test_pop_back_across_chunk_boundary},
         {"pop_back releases pages", test_pop_back_releases_pages},
-        {"swap flat vectors", test_swap_flat_vectors},
-        {"swap flat with paged", test_swap_flat_with_paged},
-        {"out of pages throws", test_out_of_pages_throws},
+        {"insert and erase", test_insert_and_erase},
+        {"swap and move", test_swap_and_move},
+        {"copy vector", test_copy_vector},
+        {"out of pages reports error", test_out_of_pages_reports_error},
+        {"out of range reports error", test_out_of_range_reports_error},
         {"no leaks for non-trivial elements", test_no_leaks_for_non_trivial_elements},
-        {"clear after pop frees flat block", test_clear_after_pop_frees_flat_block},
+        {"vector of objects with strings", test_vector_of_objects_with_strings},
         {"heap does not fragment", test_heap_does_not_fragment},
-        {"VMString basics", test_vmstring_basics},
+        {"VMString operations", test_vmstring_operations},
+        {"VMString append self", test_vmstring_append_self},
+        {"VMString too long", test_vmstring_too_long},
+        {"empty string uses no memory", test_empty_string_uses_no_memory},
+        {"VMArray", test_vmarray},
+        {"VMPtr", test_vmptr},
+        {"storage write failure reports error", test_storage_write_failure_reports_error},
+#if VM_USE_STL
+        {"STL algorithms", test_stl_algorithms},
+        {"sort objects with strings", test_sort_objects_with_strings},
+        {"string algorithms", test_string_algorithms},
+#endif
     };
 
-    for (auto& t : tests) {
+    for (const Test& t : tests) {
         std::printf("%s\n", t.name);
         reset_vm();
         t.fn();

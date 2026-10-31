@@ -128,6 +128,7 @@ Define these as build flags, or with `#define` before `#include <MicroSwap.h>` i
 | `VM_RESIDENT_PAGES` | Pages kept in RAM (4 to 254) | 4 | 8 | 5 |
 | `VM_PAGE_COUNT` | Total virtual pages | 48 | 256 | 128 |
 | `VM_HEAP_ALIGN` | Alignment of stored objects | 2 | 8 | 8 |
+| `VM_TICK_BITS` | Width of the least-recently-used counter (16 or 32) | 16 | 32 | 32 |
 
 RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
 

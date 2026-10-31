@@ -2,3 +2,4 @@ tests/test_default
 tests/test_small
 tests/*.dSYM
 tests/test_scarce
+tests/test_avr

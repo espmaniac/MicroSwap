@@ -94,9 +94,23 @@
 #define VM_USER_PIN_RESERVE 4
 #endif
 
+#ifndef VM_TICK_BITS
+/// Width of the LRU access counter. 16 bits is cheaper on 8-bit AVR; the
+/// counter is renumbered before it overflows, so either width is correct.
+#  if defined(__AVR__)
+#    define VM_TICK_BITS 16
+#  else
+#    define VM_TICK_BITS 32
+#  endif
+#endif
+
 #ifndef VM_TICK_LIMIT
 /// Testing only: value at which the LRU access counter is renumbered.
-#define VM_TICK_LIMIT 0xFFFFFFFFUL
+#  if VM_TICK_BITS == 16
+#    define VM_TICK_LIMIT 0xFFFFUL
+#  else
+#    define VM_TICK_LIMIT 0xFFFFFFFFUL
+#  endif
 #endif
 
 // Use the STL when it is available (not on AVR) so that iterators work with <algorithm>.
@@ -124,6 +138,9 @@ static_assert(VM_PAGE_SIZE >= 32 && VM_PAGE_SIZE <= 32768, "VM_PAGE_SIZE must be
 static_assert(VM_RESIDENT_PAGES >= 4 && VM_RESIDENT_PAGES <= 254,
               "VM_RESIDENT_PAGES must be in [4, 254]; container operations need up to 4 pages at once");
 static_assert(VM_PAGE_COUNT >= 1 && VM_PAGE_COUNT < 65535, "VM_PAGE_COUNT must be in [1, 65534]");
+static_assert(VM_TICK_BITS == 16 || VM_TICK_BITS == 32, "VM_TICK_BITS must be 16 or 32");
+static_assert(VM_TICK_BITS == 32 || VM_TICK_LIMIT <= 0xFFFFUL, "VM_TICK_LIMIT does not fit in 16 bits");
+static_assert(VM_TICK_LIMIT > 2 * VM_RESIDENT_PAGES, "VM_TICK_LIMIT must leave room above the renumbered values");
 
 // -----------------------------------------------------------------------------
 // Small replacements for the STL pieces the library needs
@@ -167,6 +184,9 @@ template<bool Cond, typename IfTrue, typename IfFalse>
 struct conditional { typedef IfTrue type; };
 template<typename IfTrue, typename IfFalse>
 struct conditional<false, IfTrue, IfFalse> { typedef IfFalse type; };
+
+/// LRU access counter.
+typedef conditional<VM_TICK_BITS == 16, uint16_t, uint32_t>::type Tick;
 
 template<typename T>
 struct is_trivially_destructible {
@@ -442,7 +462,7 @@ private:
         uint16_t          page;     ///< Virtual page stored here, or kNoPage.
         vm_detail::Access written;  ///< Strongest access since the page was loaded or saved.
         uint8_t           pins;     ///< Live VMPins; a pinned page is never evicted.
-        uint32_t          last_use; ///< Access tick, for least-recently-used eviction.
+        vm_detail::Tick   last_use; ///< Access tick, for least-recently-used eviction.
     };
 
     VMStorage*     _storage = nullptr;
@@ -450,7 +470,7 @@ private:
     VMError        _last_error = VMError::None;
     VMErrorHandler _handler = vm_default_error_handler;
 
-    uint32_t _tick = 0;
+    vm_detail::Tick _tick = 0;
     uint32_t _storage_size = 0; ///< Bytes known to exist in the storage.
     uint32_t _swap_ins = 0;
     uint32_t _swap_outs = 0;
@@ -568,7 +588,8 @@ private:
      * right after the overflow would look the oldest and be evicted first,
      * invalidating references that should still be valid.
      */
-    uint32_t next_tick() {
+    vm_detail::Tick next_tick() {
+        // Renumbering before the increment keeps every value <= VM_TICK_LIMIT.
         if (_tick >= VM_TICK_LIMIT) renumber_frames();
         return ++_tick;
     }

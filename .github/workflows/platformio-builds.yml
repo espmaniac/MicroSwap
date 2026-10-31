@@ -1,0 +1,46 @@
+name: PlatformIO builds
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.board }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Arduino SD library is needed where the core has none of its own.
+          - board: uno
+            sd: arduino-libraries/SD
+          - board: megaatmega2560
+            sd: arduino-libraries/SD
+          - board: bluepill_f103c8
+            sd: arduino-libraries/SD
+          - board: esp32dev
+            sd: ""
+          - board: nodemcuv2
+            sd: ""
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ matrix.board }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install platformio
+
+      - name: Build every example
+        run: |
+          for dir in examples/*/; do
+            echo "::group::$(basename "$dir")"
+            options=()
+            if [ -n "${{ matrix.sd }}" ]; then options+=(--project-option="lib_deps=${{ matrix.sd }}"); fi
+            pio ci "$dir" --lib . --board ${{ matrix.board }} "${options[@]}" || exit 1
+            echo "::endgroup::"
+          done

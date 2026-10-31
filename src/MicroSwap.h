@@ -141,6 +141,10 @@ constexpr typename remove_reference<T>::type&& move(T&& t) noexcept {
     return static_cast<typename remove_reference<T>::type&&>(t);
 }
 
+/// For unevaluated contexts only, like std::declval.
+template<typename T>
+T&& declval() noexcept;
+
 template<typename T>
 void swap(T& a, T& b) {
     T tmp(vm_detail::move(a));
@@ -1237,7 +1241,8 @@ public:
         resize(n, value);
     }
 
-    template<typename InputIt>
+    /// Only for iterators: assign(4, 1) picks assign(size_type, const T&).
+    template<typename InputIt, typename = decltype(*vm_detail::declval<InputIt>())>
     void assign(InputIt first, InputIt last) {
         clear();
         for (; first != last; ++first) push_back(*first);

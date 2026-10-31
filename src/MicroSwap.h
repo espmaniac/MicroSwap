@@ -253,7 +253,7 @@ enum class VMError : uint8_t {
     StorageIO,   ///< Reading or writing the swap file failed.
     OutOfRange,  ///< Index out of range (at(), front(), pop_back() on empty, ...).
     NullPointer, ///< A null VMPtr was dereferenced.
-    TooManyPins, ///< A VMPin would leave fewer than 4 resident pages unpinned, or every resident page is pinned.
+    TooManyPins, ///< Too few unpinned resident pages: a VMPin over the limit, or an operation needs more pages than are free.
 };
 
 /// Human-readable name of an error code.
@@ -277,7 +277,9 @@ inline const char* vm_error_name(VMError error) {
  * The default handler calls abort(). A custom handler may log and reset the
  * board, throw (where exceptions are enabled), or return. If it returns, the
  * failed operation does nothing and element access returns a placeholder
- * object with meaningless contents.
+ * object with meaningless contents. The exceptions are StorageIO, after
+ * which the page's contents are lost, and TooManyPins from deeply nested
+ * containers, after which data may be corrupted: stop or reset for those.
  */
 typedef void (*VMErrorHandler)(VMError error);
 
@@ -310,6 +312,9 @@ protected:
 /**
  * @brief Swap storage on any Arduino file with seek(), read(), write() and flush():
  *        SD, SdFat, LittleFS, SPIFFS, ...
+ *
+ * Prefer an SD card: internal flash (LittleFS, SPIFFS) wears out under the
+ * constant rewrites of swapping.
  *
  * The file must be opened for both reading and writing, and must stay open
  * while the VMManager uses it:
@@ -375,6 +380,9 @@ public:
      * @brief Start using the given swap storage. Discards all previous data.
      * @param storage Storage for swapped-out pages; must outlive the manager's use.
      * @return True on success.
+     *
+     * Containers that hold data from before this call refer to pages that no
+     * longer exist: destroy or clear them first. Empty containers are fine.
      */
     bool begin(VMStorage& storage) {
         _storage = &storage;
@@ -384,6 +392,7 @@ public:
     }
 
     /// Stop using the storage and discard all pages (nothing is written).
+    /// Containers holding data must be destroyed or cleared first.
     void end() {
         reset_tables();
         _storage = nullptr;
@@ -1099,8 +1108,8 @@ VMPtr<T> make_vm(Args&&... args) {
  * *first = 5;                // still the same element
  * @endcode
  *
- * The containers need at least 3 unpinned resident pages, so at most
- * VM_RESIDENT_PAGES - 3 different pages can be pinned at once (pins on the
+ * The containers need at least 4 unpinned resident pages, so at most
+ * VM_RESIDENT_PAGES - 4 different pages can be pinned at once (pins on the
  * same page count once). Beyond that the pin fails with VMError::TooManyPins
  * and valid() returns false.
  *
@@ -1401,6 +1410,13 @@ public:
     template<typename... Args>
     reference emplace_back(Args&&... args) {
         vm_detail::KeepResident keep(this, &args...);
+        // Growing a flat vector moves its elements, so an argument that is one
+        // of them (v.push_back(v[0])) would be read after it moved. Build the
+        // new element first in that case, like std::vector does.
+        if (_flat_mode && _size > 0 && _size == _flat_capacity && in_flat_block(&args...)) {
+            T value(vm_detail::forward<Args>(args)...);
+            return emplace_back(vm_detail::move(value));
+        }
         T* slot = back_slot();
         if (!slot) return vm_detail::placeholder<T>();
         new (slot) T(vm_detail::forward<Args>(args)...);
@@ -1576,6 +1592,20 @@ private:
     }
 
     bool has_flat_block() const { return _flat_mode && _flat_page != vm_detail::kNoPage; }
+
+    /// True if any of the objects lies inside the flat block.
+    template<typename... Ts>
+    bool in_flat_block(const Ts*... objects) const {
+        if (!has_flat_block()) return false;
+        const char* first = reinterpret_cast<const char*>(flat_element(0, vm_detail::Access::Read));
+        const char* last = first + _flat_capacity * sizeof(T);
+        const void* addresses[] = {nullptr, objects...};
+        for (const void* address : addresses) {
+            const char* p = static_cast<const char*>(address);
+            if (p >= first && p < last) return true;
+        }
+        return false;
+    }
 
     static size_type chunks_for(size_type n) { return (n + kPerPage - 1) / kPerPage; }
 
@@ -2218,19 +2248,26 @@ private:
         return b + pos;
     }
 
-    size_type find_forward(const char* set, size_type pos, bool in_set) const {
+    /// True if c is one of the characters of set. Unlike strchr, '\0' never matches.
+    static bool in_set(const char* set, size_t set_len, char c) {
+        return memchr(set, c, set_len) != nullptr;
+    }
+
+    size_type find_forward(const char* set, size_type pos, bool want_in_set) const {
         vm_detail::KeepResident keep(this, set);
+        const size_t set_len = strlen(set);
         const char* b = c_str();
         for (size_type i = pos; i < _size; ++i)
-            if ((strchr(set, b[i]) != nullptr) == in_set) return i;
+            if (in_set(set, set_len, b[i]) == want_in_set) return i;
         return npos;
     }
 
-    size_type find_backward(const char* set, size_type pos, bool in_set) const {
+    size_type find_backward(const char* set, size_type pos, bool want_in_set) const {
         vm_detail::KeepResident keep(this, set);
+        const size_t set_len = strlen(set);
         const char* b = c_str();
         for (size_type i = vm_detail::min_of(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
-            if ((strchr(set, b[i]) != nullptr) == in_set) return i;
+            if (in_set(set, set_len, b[i]) == want_in_set) return i;
         return npos;
     }
 };

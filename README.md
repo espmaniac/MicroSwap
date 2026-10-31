@@ -147,7 +147,7 @@ void onVMError(VMError error) {
 VMManager::instance().set_error_handler(onVMError);
 ```
 
-If the handler returns, the failed operation does nothing; for example, `push_back` does not add the element. Element access then returns a placeholder object with meaningless contents. `VMManager::instance().last_error()` returns the last error.
+If the handler returns, the failed operation does nothing; for example, `push_back` does not add the element. Element access then returns a placeholder object with meaningless contents. `VMManager::instance().last_error()` returns the last error. Two errors are not recoverable this way: after `StorageIO` the affected page's contents are lost, and after `TooManyPins` caused by deeply nested containers data may be corrupted, so stop or reset the board for those.
 
 ## Rules to follow
 
@@ -201,7 +201,7 @@ enum class VMError : uint8_t {
     StorageIO,    // reading or writing the swap file failed
     OutOfRange,   // index out of range: at(), front()/back()/pop_back() on empty, ...
     NullPointer,  // a null VMPtr was dereferenced
-    TooManyPins,  // a VMPin would leave fewer than 4 resident pages unpinned, or every page is pinned
+    TooManyPins,  // too few unpinned resident pages: a VMPin over the limit, or an operation needs more pages than are free
 };
 
 typedef void (*VMErrorHandler)(VMError error);
@@ -243,7 +243,7 @@ class VMManager {
 public:
     static VMManager& instance();
 
-    bool begin(VMStorage& storage);   // discards all previous data
+    bool begin(VMStorage& storage);   // discards all previous data: clear or destroy containers holding data first
     void end();                       // discards all pages, writes nothing
     bool flush_all();                 // writes modified resident pages, then storage.flush(); false if a write failed
 

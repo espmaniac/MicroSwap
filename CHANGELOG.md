@@ -11,7 +11,7 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - `VMPin<T>` and `vm_pin()` to keep a page in RAM while a reference to it is held.
 - Error handler (`set_error_handler`, `last_error`, `vm_error_name`) instead of exceptions.
 - Statistics: `free_pages()`, `swap_in_count()`, `swap_out_count()`.
-- Per-platform defaults for `VM_PAGE_SIZE`, `VM_RESIDENT_PAGES`, `VM_PAGE_COUNT`, `VM_HEAP_ALIGN`.
+- Per-platform defaults for `VM_PAGE_SIZE`, `VM_RESIDENT_PAGES`, `VM_PAGE_COUNT`, `VM_HEAP_ALIGN`. `VM_RESIDENT_PAGES` must be at least 4.
 - `library.properties` and `library.json`; examples for every container, pinning, error handling, and custom storage.
 - Host tests (two configurations, sanitizers) and CI builds for 9 boards.
 
@@ -34,6 +34,5 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - Copies of `VMArray` shared storage and freed it twice.
 - References became invalid after the LRU counter overflowed.
 - Writes made after `flush_all()` through earlier references could be lost.
-
-### Known issues
-- Changing a container that is itself stored in virtual memory (a `VMString` member of a vector element, a vector of vectors) can fail when the operation touches several pages. Pin the outer element first (see the `Pin` example).
+- Changing a container stored inside virtual memory (`people[i].name.append(...)`, `rows[i].reserve(n)`) could crash or corrupt data when the operation loaded other pages. Each operation now keeps the pages of the container and of its arguments in RAM.
+- `v.assign(4, 1)` chose the iterator-range overload and did not compile.

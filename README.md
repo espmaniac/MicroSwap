@@ -2,7 +2,7 @@
 
 Virtual memory with a swap file, and STL-like containers on top of it, for Arduino boards with little RAM.
 
-MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an SD card or flash. Pages are loaded back automatically when you access them, and the least recently used page is written out to make room. An Arduino Uno can hold a `VMVector<long>` of thousands of elements while using about 0.5 KB of RAM for data.
+MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an SD card or flash. Pages are loaded back automatically when you access them, and the least recently used page is written out to make room. An Arduino Uno can hold a `VMVector<long>` of thousands of elements while using about 0.7 KB of RAM.
 
 - `VMVector<T>`: vector, works with `std::sort` and other algorithms where the STL exists
 - `VMArray<T, N>`: fixed-size array
@@ -57,7 +57,7 @@ build_flags = -DVM_RESIDENT_PAGES=4
 | [Array](examples/Array/Array.ino) | `VMArray` as a global, arrays of structs, fill, copy, iterators |
 | [String](examples/String/String.ino) | Building, searching, extracting, editing and comparing `VMString` |
 | [Pointer](examples/Pointer/Pointer.ino) | `make_vm`, `VMPtr` as a long-lived object used from `loop()`, `destroy()` |
-| [Pin](examples/Pin/Pin.ino) | Keeping references with `VMPin`, changing a container stored inside a container |
+| [Pin](examples/Pin/Pin.ino) | Keeping references and C strings valid with `VMPin`, and the pin limit |
 | [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
 | [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
 | [CustomStorage](examples/CustomStorage/CustomStorage.ino) | Swapping to an SPI SRAM chip by implementing `VMStorage` |
@@ -125,8 +125,8 @@ Define these as build flags, or with `#define` before `#include <MicroSwap.h>` i
 | Macro | Meaning | AVR | ESP32 | Others |
 |---|---|---|---|---|
 | `VM_PAGE_SIZE` | Bytes per page; also the largest string, array or object | 128 | 4096 | 1024 |
-| `VM_RESIDENT_PAGES` | Pages kept in RAM (3 to 254) | 3 | 8 | 4 |
-| `VM_PAGE_COUNT` | Total virtual pages | 64 | 256 | 128 |
+| `VM_RESIDENT_PAGES` | Pages kept in RAM (4 to 254) | 4 | 8 | 5 |
+| `VM_PAGE_COUNT` | Total virtual pages | 48 | 256 | 128 |
 | `VM_HEAP_ALIGN` | Alignment of stored objects | 2 | 8 | 8 |
 
 RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
@@ -168,14 +168,9 @@ for (size_t i = 0; i < v.size(); ++i) total += v[i];
 *first = 5;                                        // right: the page was kept in RAM
 ```
 
-The containers need 3 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 3` different pages can be pinned at once; pins on the same page count once. On AVR the default is 3 resident pages, so set `VM_RESIDENT_PAGES` to 4 to pin one page (128 more bytes of RAM). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
+The containers need 4 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 4` different pages can be pinned at once; pins on the same page count once. That is one pin by default, four on ESP32, and none on AVR: there, set `VM_RESIDENT_PAGES` to 5 to pin one page (or 5 pages of 64 bytes, as the `Pin` example does, to keep the RAM use). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
 
-**Pin the outer object when changing a nested container.** A container stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors, keeps its own fields in a page. An operation that touches several other pages (growing a string, `reserve()`, `resize()`, `assign()`) can swap that page out halfway through. Until the library handles this itself, pin the outer element first:
-
-```cpp
-VMPin<Person> person(people[i]);
-person->name.append(suffix);
-```
+**Containers inside containers.** A container can be stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors. Each operation keeps in RAM the page of the container itself and of the objects passed to it, so this works like any other use. It needs up to 4 resident pages at once, plus one for each further level of nesting (a vector of vectors of objects with strings needs 5). If there are not enough, the operation reports `VMError::TooManyPins` before anything is changed; the default handler stops the program there. A handler that returns lets the operation continue, and data may then be corrupted.
 
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 
@@ -199,7 +194,7 @@ enum class VMError : uint8_t {
     StorageIO,    // reading or writing the swap file failed
     OutOfRange,   // index out of range: at(), front()/back()/pop_back() on empty, ...
     NullPointer,  // a null VMPtr was dereferenced
-    TooManyPins,  // a VMPin would leave fewer than 3 resident pages unpinned
+    TooManyPins,  // a VMPin would leave fewer than 4 resident pages unpinned, or every page is pinned
 };
 
 typedef void (*VMErrorHandler)(VMError error);

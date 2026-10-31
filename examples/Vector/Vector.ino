@@ -94,6 +94,15 @@ void setup() {
     Serial.print(F("copy < filled: "));
     Serial.println(copy < filled ? F("yes") : F("no"));
 
+    // ---- Vectors of vectors ----
+    // A container stored inside another one works like any other.
+    VMVector<VMVector<int> > rows;
+    for (int r = 0; r < 3; ++r) {
+        rows.emplace_back();
+        for (int c = 0; c <= r; ++c) rows[r].push_back(r * 10 + c);
+    }
+    printVector(F("rows[2]"), rows[2]); // 20 21 22
+
     big.clear(); // frees all of its storage
     Serial.print(F("Free pages: "));
     Serial.println(VMManager::instance().free_pages());

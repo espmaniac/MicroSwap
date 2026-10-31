@@ -54,8 +54,8 @@
 
 #if defined(__AVR__)
 #  define VM_DEFAULT_PAGE_SIZE      128
-#  define VM_DEFAULT_RESIDENT_PAGES 3
-#  define VM_DEFAULT_PAGE_COUNT     64
+#  define VM_DEFAULT_RESIDENT_PAGES 4
+#  define VM_DEFAULT_PAGE_COUNT     48
 #  define VM_DEFAULT_HEAP_ALIGN     2
 #elif defined(ESP32)
 #  define VM_DEFAULT_PAGE_SIZE      4096
@@ -64,7 +64,7 @@
 #  define VM_DEFAULT_HEAP_ALIGN     8
 #else
 #  define VM_DEFAULT_PAGE_SIZE      1024
-#  define VM_DEFAULT_RESIDENT_PAGES 4
+#  define VM_DEFAULT_RESIDENT_PAGES 5
 #  define VM_DEFAULT_PAGE_COUNT     128
 #  define VM_DEFAULT_HEAP_ALIGN     8
 #endif
@@ -116,8 +116,8 @@ static_assert(VM_HEAP_ALIGN >= 2 && (VM_HEAP_ALIGN & (VM_HEAP_ALIGN - 1)) == 0,
               "VM_HEAP_ALIGN must be a power of two, at least 2");
 static_assert(VM_PAGE_SIZE % VM_HEAP_ALIGN == 0, "VM_PAGE_SIZE must be a multiple of VM_HEAP_ALIGN");
 static_assert(VM_PAGE_SIZE >= 32 && VM_PAGE_SIZE <= 32768, "VM_PAGE_SIZE must be in [32, 32768]");
-static_assert(VM_RESIDENT_PAGES >= 3 && VM_RESIDENT_PAGES <= 254,
-              "VM_RESIDENT_PAGES must be in [3, 254]; containers touch up to 3 pages at once");
+static_assert(VM_RESIDENT_PAGES >= 4 && VM_RESIDENT_PAGES <= 254,
+              "VM_RESIDENT_PAGES must be in [4, 254]; container operations need up to 4 pages at once");
 static_assert(VM_PAGE_COUNT >= 1 && VM_PAGE_COUNT < 65535, "VM_PAGE_COUNT must be in [1, 65534]");
 
 // -----------------------------------------------------------------------------
@@ -229,7 +229,7 @@ enum class VMError : uint8_t {
     StorageIO,   ///< Reading or writing the swap file failed.
     OutOfRange,  ///< Index out of range (at(), front(), pop_back() on empty, ...).
     NullPointer, ///< A null VMPtr was dereferenced.
-    TooManyPins, ///< A VMPin would leave fewer than 3 resident pages unpinned.
+    TooManyPins, ///< A VMPin would leave fewer than 4 resident pages unpinned, or every resident page is pinned.
 };
 
 /// Human-readable name of an error code.
@@ -317,6 +317,7 @@ private:
 };
 
 // Forward declarations for friend declarations
+namespace vm_detail { class KeepResident; }
 template<typename T> class VMPtr;
 template<typename T> class VMPin;
 template<typename T> class VMVector;
@@ -407,6 +408,7 @@ public:
 private:
     template<typename T> friend class ::VMPtr;
     template<typename T> friend class ::VMPin;
+    friend class vm_detail::KeepResident;
     template<typename T> friend class ::VMVector;
     template<typename T, size_t N> friend class ::VMArray;
     friend class ::VMString;
@@ -588,7 +590,9 @@ private:
      * @brief Return a free resident slot, evicting the least recently used
      *        unpinned page if necessary.
      *
-     * pin() keeps at least 3 slots unpinned, so a victim always exists.
+     * If every slot is pinned (deeply nested containers with too few
+     * resident pages), reports TooManyPins and evicts the least recently
+     * used page anyway; references into it then become invalid.
      */
     uint8_t acquire_frame() {
         uint8_t victim = vm_detail::kNoFrame;
@@ -596,6 +600,13 @@ private:
             if (_frames[f].page == vm_detail::kNoPage) return f;
             if (_frames[f].pins > 0) continue;
             if (victim == vm_detail::kNoFrame || _frames[f].last_use < _frames[victim].last_use) victim = f;
+        }
+        if (victim == vm_detail::kNoFrame) {
+            fail(VMError::TooManyPins);
+            victim = 0;
+            for (uint8_t f = 1; f < VM_RESIDENT_PAGES; ++f)
+                if (_frames[f].last_use < _frames[victim].last_use) victim = f;
+            _frames[victim].pins = 0;
         }
 
         save_frame(victim);
@@ -656,7 +667,7 @@ private:
 
     // -------------------- Pins --------------------
 
-    enum : uint8_t { kMinUnpinned = 3 }; ///< Containers hold up to 3 pages at once.
+    enum : uint8_t { kMinUnpinned = 4 }; ///< Container operations need up to 4 pages at once.
 
     /// Resident slot whose RAM contains `address`, or kNoFrame.
     uint8_t frame_of(const void* address) const {
@@ -690,7 +701,21 @@ private:
         return f;
     }
 
-    /// Undo pin(). Ignored if the page was freed in the meantime.
+    /**
+     * @brief Pin for the duration of one container operation (see KeepResident).
+     *
+     * Unlike pin(), this has no limit: an operation must be able to keep
+     * the objects it works on.
+     */
+    uint8_t pin_internal(const void* address) {
+        const uint8_t f = frame_of(address);
+        if (f == vm_detail::kNoFrame || _frames[f].page == vm_detail::kNoPage) return vm_detail::kNoFrame;
+        if (_frames[f].pins == 0xFF) { fail(VMError::TooManyPins); return vm_detail::kNoFrame; }
+        _frames[f].pins++;
+        return f;
+    }
+
+    /// Undo pin() or pin_internal(). Ignored if the page was freed in the meantime.
     void unpin(uint8_t f, uint16_t page) {
         if (f >= VM_RESIDENT_PAGES || _frames[f].page != page || _frames[f].pins == 0) return;
         _frames[f].pins--;
@@ -799,6 +824,57 @@ private:
     }
 };
 
+namespace vm_detail {
+
+/**
+ * @brief Keeps the pages holding the given objects in RAM for one container
+ *        operation: the container itself and the objects passed to it.
+ *
+ * A container stored inside virtual memory (a VMString member of a vector
+ * element, a vector of vectors) keeps its own fields in a page. Its
+ * operations load other pages, so without this its page could be evicted
+ * halfway through. Objects in ordinary RAM are ignored, so for containers
+ * that are local or global variables this costs one address comparison.
+ */
+class KeepResident {
+public:
+    template<typename... Ts>
+    explicit KeepResident(const void* first, const Ts*... rest) {
+        const void* addresses[] = {first, rest...};
+        for (const void* address : addresses) add(address);
+    }
+
+    ~KeepResident() {
+        VMManager& mgr = VMManager::instance();
+        while (_count > 0) {
+            --_count;
+            mgr.unpin(_frames[_count], _pages[_count]);
+        }
+    }
+
+    KeepResident(const KeepResident&) = delete;
+    KeepResident& operator=(const KeepResident&) = delete;
+
+private:
+    enum : uint8_t { kMax = 6 };
+
+    uint8_t  _frames[kMax];
+    uint16_t _pages[kMax];
+    uint8_t  _count = 0;
+
+    void add(const void* address) {
+        if (_count == kMax) return;
+        VMManager& mgr = VMManager::instance();
+        const uint8_t f = mgr.pin_internal(address);
+        if (f == kNoFrame) return;
+        _frames[_count] = f;
+        _pages[_count] = mgr._frames[f].page;
+        _count++;
+    }
+};
+
+} // namespace vm_detail
+
 // -----------------------------------------------------------------------------
 // VMPtr
 // -----------------------------------------------------------------------------
@@ -831,6 +907,7 @@ public:
     /// Destroy the object and free its storage. The pointer becomes null.
     void destroy() {
         if (!valid()) return;
+        vm_detail::KeepResident keep(this);
         vm_detail::destroy(pointer(vm_detail::Access::Write));
         VMManager::instance().heap_free(_page, _offset);
         _page = vm_detail::kNoPage;
@@ -872,6 +949,8 @@ VMPtr<T> make_vm(Args&&... args) {
     static_assert(sizeof(T) <= vm_detail::kHeapMaxPayload, "make_vm: object does not fit in one page");
     static_assert(alignof(T) <= VM_HEAP_ALIGN, "make_vm: alignment exceeds VM_HEAP_ALIGN");
 
+    // The arguments may live in virtual memory too (make_vm<Person>(people[0])).
+    vm_detail::KeepResident keep(nullptr, &args...);
     VMManager& mgr = VMManager::instance();
     uint16_t page = vm_detail::kNoPage;
     uint16_t offset = 0;
@@ -1147,6 +1226,7 @@ public:
     bool is_flat() const { return _flat_mode; }
 
     void reserve(size_type n) {
+        vm_detail::KeepResident keep(this);
         if (n <= capacity()) return;
         if (_flat_mode && grow_flat_block(n)) return;
         if (_flat_mode && !transition_to_paged()) return;
@@ -1155,6 +1235,7 @@ public:
 
     /// Release pages beyond those needed for size() (paged mode).
     void shrink_to_fit() {
+        vm_detail::KeepResident keep(this);
         if (_flat_mode) return;
         while (_chunk_count > chunks_for(_size)) release_last_chunk();
     }
@@ -1167,6 +1248,7 @@ public:
     /// Construct an element at the end. Returns a placeholder if there is no room.
     template<typename... Args>
     reference emplace_back(Args&&... args) {
+        vm_detail::KeepResident keep(this, &args...);
         T* slot = back_slot();
         if (!slot) return vm_detail::placeholder<T>();
         new (slot) T(vm_detail::forward<Args>(args)...);
@@ -1177,6 +1259,7 @@ public:
     /// Construct an element before pos.
     template<typename... Args>
     iterator emplace(const_iterator pos, Args&&... args) {
+        vm_detail::KeepResident keep(this, &args...);
         const size_type idx = pos.pos();
         const size_type old_size = _size;
         emplace_back(vm_detail::forward<Args>(args)...);
@@ -1192,6 +1275,7 @@ public:
     iterator insert(const_iterator pos, T&& value) { return emplace(pos, vm_detail::move(value)); }
 
     iterator erase(const_iterator pos) {
+        vm_detail::KeepResident keep(this);
         const size_type idx = pos.pos();
         if (idx >= _size) return end();
         for (size_type i = idx; i + 1 < _size; ++i)
@@ -1201,6 +1285,7 @@ public:
     }
 
     void pop_back() {
+        vm_detail::KeepResident keep(this);
         if (_size == 0) { VMManager::instance().fail(VMError::OutOfRange); return; }
         _size--;
         if (!vm_detail::is_trivially_destructible<T>::value) element(_size, vm_detail::Access::Write)->~T();
@@ -1211,6 +1296,7 @@ public:
 
     /// Destroy all elements and free all storage.
     void clear() {
+        vm_detail::KeepResident keep(this);
         if (!vm_detail::is_trivially_destructible<T>::value)
             for (size_type i = 0; i < _size; ++i) element(i, vm_detail::Access::Write)->~T();
         _size = 0;
@@ -1228,6 +1314,7 @@ public:
     }
 
     void resize(size_type n, const T& value = T()) {
+        vm_detail::KeepResident keep(this, &value);
         while (_size > n) pop_back();
         while (_size < n) {
             const size_type old_size = _size;
@@ -1237,6 +1324,7 @@ public:
     }
 
     void assign(size_type n, const T& value) {
+        vm_detail::KeepResident keep(this, &value);
         clear();
         resize(n, value);
     }
@@ -1244,6 +1332,7 @@ public:
     /// Only for iterators: assign(4, 1) picks assign(size_type, const T&).
     template<typename InputIt, typename = decltype(*vm_detail::declval<InputIt>())>
     void assign(InputIt first, InputIt last) {
+        vm_detail::KeepResident keep(this);
         clear();
         for (; first != last; ++first) push_back(*first);
     }
@@ -1278,6 +1367,7 @@ public:
     // -------------------- Comparisons --------------------
 
     bool operator==(const VMVector& other) const {
+        vm_detail::KeepResident keep(this, &other);
         if (_size != other._size) return false;
         for (size_type i = 0; i < _size; ++i)
             if (!((*this)[i] == other[i])) return false;
@@ -1286,6 +1376,7 @@ public:
     bool operator!=(const VMVector& other) const { return !(*this == other); }
 
     bool operator<(const VMVector& other) const {
+        vm_detail::KeepResident keep(this, &other);
         const size_type n = vm_detail::min_of(_size, other._size);
         for (size_type i = 0; i < n; ++i) {
             if ((*this)[i] < other[i]) return true;
@@ -1450,6 +1541,7 @@ public:
     VMArray() {}
 
     VMArray(const VMArray& other) {
+        vm_detail::KeepResident keep(this, &other);
         if (!other.allocated() || !allocate()) return;
         for (size_type i = 0; i < N; ++i) new (raw_element(i)) T(other[i]);
     }
@@ -1459,6 +1551,7 @@ public:
     }
 
     VMArray& operator=(const VMArray& other) {
+        vm_detail::KeepResident keep(this, &other);
         if (this != &other)
             for (size_type i = 0; i < N; ++i) *element(i, vm_detail::Access::Write) = other[i];
         return *this;
@@ -1491,6 +1584,7 @@ public:
     constexpr bool empty() const { return N == 0; }
 
     void fill(const T& value) {
+        vm_detail::KeepResident keep(this, &value);
         for (size_type i = 0; i < N; ++i) *element(i, vm_detail::Access::Write) = value;
     }
 
@@ -1529,6 +1623,7 @@ private:
     }
 
     void release() {
+        vm_detail::KeepResident keep(this);
         if (!allocated()) return;
         if (!vm_detail::is_trivially_destructible<T>::value)
             for (size_type i = 0; i < N; ++i) raw_element(i)->~T();
@@ -1544,6 +1639,7 @@ private:
 
     T* element(size_type i, vm_detail::Access access) const {
         if (!allocated()) {
+            vm_detail::KeepResident keep(this);
             if (!allocate()) return &vm_detail::placeholder<T>();
             for (size_type k = 0; k < N; ++k) new (raw_element(k)) T();
         }
@@ -1586,7 +1682,7 @@ public:
     VMString(const char* s) { assign(s); }
     VMString(const char* s, size_type count) { assign(s, count); }
     VMString(size_type count, char ch) { assign(count, ch); }
-    VMString(const VMString& other) { assign(other.c_str(), other._size); }
+    VMString(const VMString& other) { const size_type n = other._size; assign(other.c_str(), n); }
 
     VMString(VMString&& other) noexcept
         : _page(other._page), _offset(other._offset), _size(other._size), _capacity(other._capacity) {
@@ -1594,11 +1690,14 @@ public:
     }
 
     VMString& operator=(const VMString& other) {
-        if (this != &other) assign(other.c_str(), other._size);
+        if (this == &other) return *this;
+        const size_type n = other._size;
+        assign(other.c_str(), n);
         return *this;
     }
 
     VMString& operator=(VMString&& other) noexcept {
+        vm_detail::KeepResident keep(this, &other);
         if (this != &other) {
             release();
             _page = other._page;
@@ -1681,7 +1780,7 @@ public:
 
     VMString& append(const char* s) { return append(s, strlen(s)); }
     VMString& append(const char* s, size_type count) { return replace(_size, 0, s, count); }
-    VMString& append(const VMString& other) { return append(other.c_str(), other._size); }
+    VMString& append(const VMString& other) { const size_type n = other._size; return append(other.c_str(), n); }
     VMString& append(size_type count, char ch) { return insert(_size, count, ch); }
 
     void push_back(char c) { append(1, c); }
@@ -1697,7 +1796,7 @@ public:
 
     VMString& insert(size_type pos, const char* s) { return insert(pos, s, strlen(s)); }
     VMString& insert(size_type pos, const char* s, size_type count) { return replace(pos, 0, s, count); }
-    VMString& insert(size_type pos, const VMString& other) { return insert(pos, other.c_str(), other._size); }
+    VMString& insert(size_type pos, const VMString& other) { const size_type n = other._size; return insert(pos, other.c_str(), n); }
     VMString& insert(size_type pos, size_type count, char ch) {
         if (char* gap = open_gap(pos, 0, count)) memset(gap, ch, count);
         return *this;
@@ -1710,6 +1809,7 @@ public:
 
     /// Replace count characters at pos with s[0, s_count).
     VMString& replace(size_type pos, size_type count, const char* s, size_type s_count) {
+        vm_detail::KeepResident keep(this, s);
         if (points_into_buffer(s)) {
             // s would move or be overwritten while editing; work from a copy.
             VMString copy(s, s_count);
@@ -1720,16 +1820,19 @@ public:
     }
     VMString& replace(size_type pos, size_type count, const char* s) { return replace(pos, count, s, strlen(s)); }
     VMString& replace(size_type pos, size_type count, const VMString& other) {
-        return replace(pos, count, other.c_str(), other._size);
+        const size_type n = other._size;
+        return replace(pos, count, other.c_str(), n);
     }
 
     VMString substr(size_type pos = 0, size_type count = npos) const {
+        vm_detail::KeepResident keep(this);
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return VMString(); }
         return VMString(c_str() + pos, vm_detail::min_of(count, _size - pos));
     }
 
     /// Copy up to count characters starting at pos to dest (not null-terminated).
     size_type copy(char* dest, size_type count, size_type pos = 0) const {
+        vm_detail::KeepResident keep(this, dest);
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return 0; }
         const size_type n = vm_detail::min_of(count, _size - pos);
         memcpy(dest, c_str() + pos, n);
@@ -1746,6 +1849,7 @@ public:
     // -------------------- Search --------------------
 
     size_type find(const char* s, size_type pos, size_type count) const {
+        vm_detail::KeepResident keep(this, s);
         if (count == 0) return pos <= _size ? pos : npos;
         const char* b = c_str();
         for (size_type i = pos; i + count <= _size; ++i)
@@ -1753,10 +1857,11 @@ public:
         return npos;
     }
     size_type find(const char* s, size_type pos = 0) const { return find(s, pos, strlen(s)); }
-    size_type find(const VMString& other, size_type pos = 0) const { return find(other.c_str(), pos, other._size); }
+    size_type find(const VMString& other, size_type pos = 0) const { const size_type n = other._size; return find(other.c_str(), pos, n); }
     size_type find(char ch, size_type pos = 0) const { return find(&ch, pos, 1); }
 
     size_type rfind(const char* s, size_type pos, size_type count) const {
+        vm_detail::KeepResident keep(this, s);
         if (count > _size) return npos;
         const char* b = c_str();
         for (size_type i = vm_detail::min_of(pos, _size - count) + 1; i-- > 0;)
@@ -1764,7 +1869,7 @@ public:
         return npos;
     }
     size_type rfind(const char* s, size_type pos = npos) const { return rfind(s, pos, strlen(s)); }
-    size_type rfind(const VMString& other, size_type pos = npos) const { return rfind(other.c_str(), pos, other._size); }
+    size_type rfind(const VMString& other, size_type pos = npos) const { const size_type n = other._size; return rfind(other.c_str(), pos, n); }
     size_type rfind(char ch, size_type pos = npos) const { return rfind(&ch, pos, 1); }
 
     size_type find_first_of(const char* s, size_type pos = 0) const { return find_forward(s, pos, true); }
@@ -1786,12 +1891,13 @@ public:
     // -------------------- Comparison --------------------
 
     int compare(const char* s, size_type s_len) const {
+        vm_detail::KeepResident keep(this, s);
         const int r = memcmp(c_str(), s, vm_detail::min_of(_size, s_len));
         if (r != 0) return r;
         return _size == s_len ? 0 : (_size < s_len ? -1 : 1);
     }
     int compare(const char* s) const { return compare(s, strlen(s)); }
-    int compare(const VMString& other) const { return compare(other.c_str(), other._size); }
+    int compare(const VMString& other) const { const size_type n = other._size; return compare(other.c_str(), n); }
 
     bool operator==(const VMString& other) const { return compare(other) == 0; }
     bool operator!=(const VMString& other) const { return compare(other) != 0; }
@@ -1834,6 +1940,7 @@ private:
     }
 
     void release() {
+        vm_detail::KeepResident keep(this);
         if (has_block()) VMManager::instance().heap_free(_page, _offset);
         forget_block();
     }
@@ -1843,6 +1950,7 @@ private:
      * @return False if the string cannot grow that much.
      */
     bool ensure_capacity(size_type needed, size_type wanted) {
+        vm_detail::KeepResident keep(this);
         if (has_block() && needed <= _capacity) return true;
         if (needed > max_size()) { VMManager::instance().fail(VMError::TooLarge); return false; }
 
@@ -1869,6 +1977,7 @@ private:
      * @return Pointer to the gap (valid until the page is evicted), or nullptr on failure.
      */
     char* open_gap(size_type pos, size_type count, size_type gap_len) {
+        vm_detail::KeepResident keep(this);
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return nullptr; }
         count = vm_detail::min_of(count, _size - pos);
 
@@ -1884,6 +1993,7 @@ private:
     }
 
     size_type find_forward(const char* set, size_type pos, bool in_set) const {
+        vm_detail::KeepResident keep(this, set);
         const char* b = c_str();
         for (size_type i = pos; i < _size; ++i)
             if ((strchr(set, b[i]) != nullptr) == in_set) return i;
@@ -1891,6 +2001,7 @@ private:
     }
 
     size_type find_backward(const char* set, size_type pos, bool in_set) const {
+        vm_detail::KeepResident keep(this, set);
         const char* b = c_str();
         for (size_type i = vm_detail::min_of(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
             if ((strchr(set, b[i]) != nullptr) == in_set) return i;

@@ -399,7 +399,7 @@ static void test_storage_flushed_only_by_flush_all() {
 }
 
 /// Pages that can be pinned at once in this configuration.
-static const int PINNABLE = VM_RESIDENT_PAGES > 3 ? VM_RESIDENT_PAGES - 3 : 0;
+static const int PINNABLE = VM_RESIDENT_PAGES > 4 ? VM_RESIDENT_PAGES - 4 : 0;
 
 /// Read every page of v, evicting everything that is not pinned. Reads go
 /// through a const reference, so they never mark pages as possibly written.
@@ -515,6 +515,117 @@ static void test_pinned_nested_container_grows() {
     CHECK(wrong == 0);
 }
 
+// ---- Containers stored inside virtual memory ----
+// Each operation must keep the page holding the container itself in RAM,
+// even with only the minimum number of resident pages.
+
+static void fill_people(VMVector<Person>& people, int n) {
+    char name[16];
+    for (int i = 0; i < n; ++i) {
+        std::snprintf(name, sizeof(name), "p%d", i);
+        people.emplace_back(i, name);
+    }
+}
+
+static void test_append_to_string_inside_vector() {
+    VMVector<Person> people;
+    fill_people(people, 60);
+    VMVector<VMString> suffixes;
+    char text[16];
+    for (int i = 0; i < 60; ++i) {
+        std::snprintf(text, sizeof(text), "-s%d", i);
+        suffixes.emplace_back(text);
+    }
+
+    // Each append reallocates the name while reading another VM string.
+    for (int round = 0; round < 3; ++round)
+        for (int i = 0; i < 60; ++i) people[i].name.append(suffixes[59 - i]);
+
+    int wrong = 0;
+    for (int i = 0; i < 60; ++i) {
+        char want[64];
+        std::snprintf(want, sizeof(want), "p%d-s%d-s%d-s%d", i, 59 - i, 59 - i, 59 - i);
+        if (!(people[i].name == want) || people[i].age != i) wrong++;
+    }
+    CHECK(wrong == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_reserve_inside_vector_of_vectors() {
+    VMVector<VMVector<long> > rows;
+    for (int r = 0; r < 60; ++r) rows.emplace_back(); // the outer vector spans pages
+    const long n = long(VM_PAGE_SIZE / sizeof(long)) * VM_RESIDENT_PAGES * 2;
+
+    rows[40].reserve(size_t(n)); // allocates many pages in one call
+    for (long i = 0; i < n; ++i) rows[40].push_back(i * 2);
+
+    size_t wrong = 0;
+    for (long i = 0; i < n; ++i)
+        if (rows[40][size_t(i)] != i * 2) wrong++;
+    CHECK(wrong == 0);
+    CHECK(rows[40].size() == size_t(n));
+    for (int r = 0; r < 60; ++r)
+        if (r != 40) CHECK(rows[r].empty());
+    CHECK(g_errors == 0);
+}
+
+static void test_compare_strings_inside_vector() {
+    VMVector<Person> people;
+    fill_people(people, 40);
+
+    // Selection sort by name, descending: compares names of two elements,
+    // each in its own page, with their buffers in two more pages.
+    for (size_t i = 0; i < people.size(); ++i)
+        for (size_t j = i + 1; j < people.size(); ++j)
+            if (people[i].name < people[j].name) vm_detail::swap(people[i], people[j]);
+
+    CHECK(people[0].name == "p9");
+    CHECK(people[39].name == "p0");
+    bool ordered = true;
+    for (size_t i = 1; i < people.size(); ++i)
+        if (people[i - 1].name < people[i].name) ordered = false;
+    CHECK(ordered);
+    CHECK(g_errors == 0);
+}
+
+static void test_copy_and_erase_objects_with_strings() {
+    VMVector<Person> people;
+    fill_people(people, 50);
+
+    VMVector<Person> copy(people); // copies every name from virtual memory
+    copy.erase(copy.begin());      // move-assigns every element one place down
+    copy.push_back(people[10]);    // copies an element of another VM vector
+
+    CHECK(copy.size() == 50);
+    CHECK(copy[0].name == "p1" && copy[0].age == 1);
+    CHECK(copy[48].name == "p49");
+    CHECK(copy[49].name == "p10" && copy[49].age == 10);
+    CHECK(people[0].name == "p0"); // the original is untouched
+    CHECK(g_errors == 0);
+}
+
+static void test_three_levels_of_nesting() {
+    // A vector of vectors of objects with strings needs one more page.
+    if (VM_RESIDENT_PAGES < 5) return;
+    VMVector<Person> source;
+    fill_people(source, 40);
+    VMVector<VMVector<Person> > groups;
+    for (int g = 0; g < 20; ++g) groups.emplace_back();
+
+    for (int i = 0; i < 40; ++i) groups[i % 20].push_back(source[i]);
+    for (int g = 0; g < 20; ++g) groups[g][1].name.append("+");
+
+    int wrong = 0;
+    for (int i = 0; i < 40; ++i) {
+        char want[16];
+        std::snprintf(want, sizeof(want), "p%d%s", i, i >= 20 ? "+" : "");
+        const Person& p = groups[i % 20][i / 20];
+        if (p.age != i || !(p.name == want)) wrong++;
+    }
+    CHECK(wrong == 0);
+    CHECK(g_errors == 0);
+}
+
 static void test_pin_outside_virtual_memory() {
     int local = 5;
     VMPin<int> p(local);
@@ -604,6 +715,11 @@ int main() {
         {"pin string and ptr", test_pin_string_and_ptr},
         {"pinned nested container grows", test_pinned_nested_container_grows},
         {"pin outside virtual memory", test_pin_outside_virtual_memory},
+        {"append to string inside vector", test_append_to_string_inside_vector},
+        {"reserve inside vector of vectors", test_reserve_inside_vector_of_vectors},
+        {"compare strings inside vector", test_compare_strings_inside_vector},
+        {"copy and erase objects with strings", test_copy_and_erase_objects_with_strings},
+        {"three levels of nesting", test_three_levels_of_nesting},
 #if VM_USE_STL
         {"STL algorithms", test_stl_algorithms},
         {"sort objects with strings", test_sort_objects_with_strings},

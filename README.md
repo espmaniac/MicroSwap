@@ -211,6 +211,24 @@ The library does not lock by itself: a lock per call would cost every element ac
 
 **Data does not survive a reset.** `begin()` starts with empty memory.
 
+## Speed
+
+Measured on a simulated 16 MHz ATmega (simavr, cycle-accurate) with the AVR defaults, and swap storage in RAM. This is the library's own cost; with an SD card, every page loaded or written also costs the card's transfer time, typically a few milliseconds.
+
+| Operation | Time |
+|---|---|
+| Read from a plain `long[]` (for comparison) | 1.1 µs |
+| `v[i]`, page already in RAM | 20 µs |
+| `v[i]`, sequential over a vector 8× larger than RAM | 24 µs |
+| `push_back` | 44 µs |
+| `pop_back` | 9 µs |
+| `VMString` `s[i]` | 16 µs |
+| `VMString::push_back` | 52 µs |
+| `make_vm` + `destroy` | 102 µs |
+| Swapping one page in and out (without the storage time) | 175 µs |
+
+On 32-bit boards element access is much cheaper, but the storage time dominates as soon as pages swap. So the rule is the same everywhere: work on nearby elements together, and give the library enough resident pages for the data you use at once.
+
 ## API reference
 
 Every public member, written as class declarations. Only behavior that differs from the standard C++ library is commented. All containers allocate memory on first use, so they can be global variables created before `VMManager::begin()`.

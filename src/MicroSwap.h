@@ -168,6 +168,13 @@ static_assert(VM_TICK_LIMIT > 2 * VM_RESIDENT_PAGES, "VM_TICK_LIMIT must leave r
 // Small replacements for the STL pieces the library needs
 // -----------------------------------------------------------------------------
 
+// Keeps rarely used slow paths out of the hot ones they are called from.
+#if defined(__GNUC__)
+#  define VM_NOINLINE __attribute__((noinline))
+#else
+#  define VM_NOINLINE
+#endif
+
 namespace vm_detail {
 
 template<typename T> struct remove_reference      { typedef T type; };
@@ -618,9 +625,9 @@ private:
      */
     uint8_t* page_ptr(uint16_t page, vm_detail::Access access) {
         if (!is_allocated(page)) return nullptr;
-        if (slot_of(page) == vm_detail::kNoFrame) load_page(page);
+        uint8_t f = slot_of(page);
+        if (f == vm_detail::kNoFrame) f = load_page(page);
 
-        const uint8_t f = slot_of(page);
         Frame& frame = _frames[f];
         frame.last_use = next_tick();
         if (access > frame.written) frame.written = access;
@@ -654,7 +661,7 @@ private:
         return ++_tick;
     }
 
-    void renumber_frames() {
+    VM_NOINLINE void renumber_frames() {
         uint8_t rank[VM_RESIDENT_PAGES];
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
             rank[f] = 0;
@@ -668,7 +675,8 @@ private:
         _tick = VM_RESIDENT_PAGES;
     }
 
-    void load_page(uint16_t page) {
+    /// Load a page from storage into a resident slot; returns the slot.
+    VM_NOINLINE uint8_t load_page(uint16_t page) {
         uint8_t f = acquire_frame();
         if (!_storage->read(storage_offset(page), _frame_data[f], VM_PAGE_SIZE)) {
             fail(VMError::StorageIO);
@@ -677,6 +685,7 @@ private:
         _swap_ins++;
         attach(page, f);
         VM_YIELD();
+        return f;
     }
 
     /**
@@ -1656,6 +1665,7 @@ private:
      * the first chunk. The walk only reads the page table in RAM.
      */
     uint16_t chunk_page(uint16_t k) const {
+        if (k == _cached_chunk && _cached_page != vm_detail::kNoPage) return _cached_page;
         if (k + 1 == _chunk_count) return _last_chunk;
 
         const VMManager& mgr = VMManager::instance();

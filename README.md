@@ -813,7 +813,17 @@ public:
   - Concatenation: operator+(VMString, VMString), operator+(VMString, const char*), operator+(const char*, VMString)
   - Comparisons: ==, !=, <, >, <=, >=
 
+## Running tests
+The containers can be tested on a desktop machine without any board. `tests/mock/FS.h` replaces the Arduino filesystem with an in-memory one:
+
+```sh
+make -C tests
+```
+
+Tests are built with AddressSanitizer and UndefinedBehaviorSanitizer and run on every push via GitHub Actions.
+
 ## Notes and limitations
+- VMVector throws `std::runtime_error` when it runs out of virtual memory pages.
 - VMVector hybrid storage: starts flat and may transition to paged storage; after transition, data() returns nullptr and contiguous access is not available.
 - VMString is limited to a single small-heap block; reserve/resize beyond one block throws.
 - Small-heap payload alignment is 8 bytes; types requiring stricter alignment may not be supported on all targets.

@@ -26,7 +26,8 @@
  * and evict it; at least (VM_RESIDENT_PAGES - 1) other pages can be touched
  * safely. Use a reference right away, or hold a VMPin while you keep it.
  *
- * Not thread-safe.
+ * Not thread-safe. All containers share one VMManager, so tasks need one
+ * lock for the whole library, held for as long as they use references.
  */
 
 #include <stddef.h>
@@ -34,15 +35,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Placement new. AVR cores ship <new> since 1.8.3 and <new.h> before that.
+// Placement new. Most cores ship <new>; older AVR cores only <new.h>. The
+// megaAVR core's <new.h> lacks placement new, and the SAM (Due) toolchain
+// has neither header, so it is defined here for those two.
 #if defined(__has_include)
 #  if __has_include(<new>)
 #    include <new>
-#  else
+#    define VM_HAS_STD_NEW 1
+#  elif __has_include(<new.h>)
 #    include <new.h>
 #  endif
 #else
 #  include <new>
+#  define VM_HAS_STD_NEW 1
+#endif
+#if !defined(VM_HAS_STD_NEW) && (defined(ARDUINO_ARCH_MEGAAVR) || defined(ARDUINO_ARCH_SAM))
+inline void* operator new(size_t, void* place) noexcept { return place; }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -87,6 +95,20 @@
 #ifndef VM_HEAP_ALIGN
 /// Alignment of objects stored in pages.
 #define VM_HEAP_ALIGN VM_DEFAULT_HEAP_ALIGN
+#endif
+
+#ifndef VM_YIELD
+/// Called after every page loaded from or written to storage, which takes
+/// milliseconds. On ESP8266 it calls yield(): one long operation (sorting a
+/// large vector, copying it) would otherwise run for seconds without letting
+/// Wi-Fi and the watchdog run, and the board would reset. Define it to feed
+/// your own watchdog on other boards, or as nothing to disable it.
+#  if defined(ESP8266)
+#    include <Arduino.h>
+#    define VM_YIELD() yield()
+#  else
+#    define VM_YIELD() ((void)0)
+#  endif
 #endif
 
 #ifndef VM_USER_PIN_RESERVE
@@ -654,6 +676,7 @@ private:
         }
         _swap_ins++;
         attach(page, f);
+        VM_YIELD();
     }
 
     /**
@@ -698,6 +721,7 @@ private:
         if (written == vm_detail::Access::Read) return true;
         if (written == vm_detail::Access::MayWrite && same_as_storage(f)) {
             _frames[f].written = vm_detail::Access::Read;
+            VM_YIELD(); // the comparison read the whole page
             return true;
         }
 
@@ -708,6 +732,7 @@ private:
         _frames[f].written = vm_detail::Access::Read;
         _storage_size = vm_detail::max_of<uint32_t>(_storage_size, offset + VM_PAGE_SIZE);
         _swap_outs++;
+        VM_YIELD();
         return true;
     }
 
@@ -731,6 +756,7 @@ private:
             size_t n = (size_t)vm_detail::min_of<uint32_t>(sizeof(zeros), size - _storage_size);
             if (!_storage->write(_storage_size, zeros, n)) return false;
             _storage_size += n;
+            if (_storage_size % VM_PAGE_SIZE == 0) VM_YIELD(); // can be many pages at once
         }
         return true;
     }

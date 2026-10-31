@@ -13,7 +13,8 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - Statistics: `free_pages()`, `swap_in_count()`, `swap_out_count()`.
 - Per-platform defaults for `VM_PAGE_SIZE`, `VM_RESIDENT_PAGES`, `VM_PAGE_COUNT`, `VM_HEAP_ALIGN`. `VM_RESIDENT_PAGES` must be at least 4.
 - `library.properties` and `library.json`; examples for every container, pinning, error handling, and custom storage.
-- Host tests (two configurations, sanitizers) and CI builds for 9 boards.
+- `VM_YIELD()` hook, called after every page transfer: on ESP8266 it calls `yield()`, so long operations do not trip the watchdog.
+- Host tests (four configurations, sanitizers) and CI builds for 15 boards with Arduino CLI and 5 with PlatformIO.
 
 ### Changed
 - Include `<MicroSwap.h>` instead of `containers.h`.

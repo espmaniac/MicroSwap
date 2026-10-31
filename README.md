@@ -17,9 +17,14 @@ Any Arduino core with a C++11 compiler. The library uses no exceptions, no RTTI 
 | Board | Core | `<algorithm>` support |
 |---|---|---|
 | Arduino Uno, Mega | AVR | no (the core has no STL) |
+| Arduino Nano Every | megaAVR | no |
+| Arduino Due | SAM | no |
+| Arduino Nano 33 BLE | Mbed (nRF52840) | yes |
+| Arduino Nano RP2040 Connect | Mbed (RP2040) | yes |
+| Teensy 4.1 | Teensyduino | yes |
 | Arduino MKR Zero | SAMD | yes |
 | Arduino Uno R4 Minima | Renesas | yes |
-| ESP32, ESP32-C3 | esp32 | yes |
+| ESP32, ESP32-C3, ESP32-S3 | esp32 | yes |
 | NodeMCU (ESP8266) | esp8266 | yes |
 | Blue Pill (STM32F103) | STM32duino | yes |
 | Raspberry Pi Pico | arduino-pico | yes |
@@ -129,6 +134,7 @@ Define these as build flags, or with `#define` before `#include <MicroSwap.h>` i
 | `VM_PAGE_COUNT` | Total virtual pages | 48 | 256 | 128 |
 | `VM_HEAP_ALIGN` | Alignment of stored objects | 2 | 8 | 8 |
 | `VM_TICK_BITS` | Width of the least-recently-used counter (16 or 32) | 16 | 32 | 32 |
+| `VM_YIELD()` | Called after every page transferred to or from storage | — | — | `yield()` on ESP8266, nothing elsewhere |
 
 RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
 
@@ -182,7 +188,26 @@ An operation needs up to 4 resident pages at once. Deeper nesting, or an operati
 
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 
-**Not thread-safe.** Use it from one task only, or protect it with a mutex.
+**Several tasks (ESP32, RP2040, FreeRTOS).** The library is not thread-safe, and two things matter when more than one task uses it:
+
+- *Use one lock for the whole library, not one per container.* All containers share the same `VMManager`: its page table, its pages in RAM and its usage counter. Two tasks working on two different vectors still change the same tables at the same time.
+- *Keep the lock while you use references.* `v[i]`, `*it` and `c_str()` point into a page in RAM, and another task can swap that page out. Taking the lock only around each call is not enough: hold it from getting a reference until you are done with it.
+
+```cpp
+SemaphoreHandle_t vmLock = xSemaphoreCreateMutex(); // one for all containers
+
+void worker(void*) {
+    for (;;) {
+        xSemaphoreTake(vmLock, portMAX_DELAY);
+        long& x = values[0];   // valid only while the lock is held
+        x += 1;
+        xSemaphoreGive(vmLock);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+The library does not lock by itself: a lock per call would cost every element access time without making references safe.
 
 **Data does not survive a reset.** `begin()` starts with empty memory.
 

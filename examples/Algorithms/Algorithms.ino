@@ -5,6 +5,7 @@
 // SAMD, RP2040, ...). On AVR the containers work, but <algorithm> is missing.
 
 #include <MicroSwap.h>
+#include "Person.h"
 
 #if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
 #include <LittleFS.h>
@@ -37,23 +38,6 @@ bool openSwapFile() {
     swapFile = SD.open(SWAP_PATH, O_READ | O_WRITE | O_CREAT);
 #endif
     return swapFile ? true : false;
-}
-
-struct Person {
-    int age;
-    VMString name;
-
-    Person() : age(0) {}
-    Person(int a, const char* n) : age(a), name(n) {}
-};
-
-void printPeople(const VMVector<Person>& people) {
-    for (size_t i = 0; i < people.size(); ++i) {
-        Serial.print(people[i].name.c_str());
-        Serial.print(F(" ("));
-        Serial.print(people[i].age);
-        Serial.print(i + 1 < people.size() ? F("), ") : F(")\n"));
-    }
 }
 
 void setup() {

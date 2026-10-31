@@ -144,10 +144,10 @@ void swap(T& a, T& b) {
 }
 
 template<typename T>
-constexpr T min(T a, T b) { return b < a ? b : a; }
+constexpr T min_of(T a, T b) { return b < a ? b : a; }
 
 template<typename T>
-constexpr T max(T a, T b) { return a < b ? b : a; }
+constexpr T max_of(T a, T b) { return a < b ? b : a; }
 
 template<bool Cond, typename IfTrue, typename IfFalse>
 struct conditional { typedef IfTrue type; };
@@ -544,7 +544,7 @@ private:
         if (!ok) { fail(VMError::StorageIO); return false; }
 
         _frames[f].dirty = false;
-        _storage_size = vm_detail::max<uint32_t>(_storage_size, offset + VM_PAGE_SIZE);
+        _storage_size = vm_detail::max_of<uint32_t>(_storage_size, offset + VM_PAGE_SIZE);
         _swap_outs++;
         return true;
     }
@@ -554,7 +554,7 @@ private:
         uint8_t zeros[32];
         memset(zeros, 0, sizeof(zeros));
         while (_storage_size < size) {
-            size_t n = (size_t)vm_detail::min<uint32_t>(sizeof(zeros), size - _storage_size);
+            size_t n = (size_t)vm_detail::min_of<uint32_t>(sizeof(zeros), size - _storage_size);
             if (!_storage->write(_storage_size, zeros, n)) return false;
             _storage_size += n;
         }
@@ -658,7 +658,7 @@ private:
                 block->size = uint16_t(block->size + header + block_at(data, next)->size);
                 next = off + header + block->size;
             }
-            largest = vm_detail::max(largest, block->size);
+            largest = vm_detail::max_of(largest, block->size);
         }
         return largest;
     }
@@ -1076,7 +1076,7 @@ public:
     bool operator!=(const VMVector& other) const { return !(*this == other); }
 
     bool operator<(const VMVector& other) const {
-        const size_type n = vm_detail::min(_size, other._size);
+        const size_type n = vm_detail::min_of(_size, other._size);
         for (size_type i = 0; i < n; ++i) {
             if ((*this)[i] < other[i]) return true;
             if (other[i] < (*this)[i]) return false;
@@ -1141,8 +1141,8 @@ private:
         if (n > kMaxFlat) return false;
 
         // Grow geometrically so repeated push_back stays cheap.
-        size_type new_cap = vm_detail::max<size_type>(n, _flat_capacity * 2);
-        new_cap = vm_detail::min<size_type>(vm_detail::max<size_type>(new_cap, 4), kMaxFlat);
+        size_type new_cap = vm_detail::max_of<size_type>(n, _flat_capacity * 2);
+        new_cap = vm_detail::min_of<size_type>(vm_detail::max_of<size_type>(new_cap, 4), kMaxFlat);
 
         VMManager& mgr = VMManager::instance();
         uint16_t page = vm_detail::kNoPage;
@@ -1196,7 +1196,7 @@ private:
     }
 
     bool grow_chunk_table() {
-        const uint16_t slots = vm_detail::min<uint16_t>(_chunk_slots ? _chunk_slots * 2 : 4, VM_PAGE_COUNT);
+        const uint16_t slots = vm_detail::min_of<uint16_t>(_chunk_slots ? _chunk_slots * 2 : 4, VM_PAGE_COUNT);
         uint16_t* table = static_cast<uint16_t*>(realloc(_chunks, slots * sizeof(uint16_t)));
         if (!table) { VMManager::instance().fail(VMError::OutOfMemory); return false; }
         _chunks = table;
@@ -1515,13 +1515,13 @@ public:
 
     VMString substr(size_type pos = 0, size_type count = npos) const {
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return VMString(); }
-        return VMString(c_str() + pos, vm_detail::min(count, _size - pos));
+        return VMString(c_str() + pos, vm_detail::min_of(count, _size - pos));
     }
 
     /// Copy up to count characters starting at pos to dest (not null-terminated).
     size_type copy(char* dest, size_type count, size_type pos = 0) const {
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return 0; }
-        const size_type n = vm_detail::min(count, _size - pos);
+        const size_type n = vm_detail::min_of(count, _size - pos);
         memcpy(dest, c_str() + pos, n);
         return n;
     }
@@ -1549,7 +1549,7 @@ public:
     size_type rfind(const char* s, size_type pos, size_type count) const {
         if (count > _size) return npos;
         const char* b = c_str();
-        for (size_type i = vm_detail::min(pos, _size - count) + 1; i-- > 0;)
+        for (size_type i = vm_detail::min_of(pos, _size - count) + 1; i-- > 0;)
             if (memcmp(b + i, s, count) == 0) return i;
         return npos;
     }
@@ -1576,7 +1576,7 @@ public:
     // -------------------- Comparison --------------------
 
     int compare(const char* s, size_type s_len) const {
-        const int r = memcmp(c_str(), s, vm_detail::min(_size, s_len));
+        const int r = memcmp(c_str(), s, vm_detail::min_of(_size, s_len));
         if (r != 0) return r;
         return _size == s_len ? 0 : (_size < s_len ? -1 : 1);
     }
@@ -1636,7 +1636,7 @@ private:
         if (has_block() && needed <= _capacity) return true;
         if (needed > max_size()) { VMManager::instance().fail(VMError::TooLarge); return false; }
 
-        const size_type new_cap = vm_detail::min(vm_detail::max(wanted, needed), max_size());
+        const size_type new_cap = vm_detail::min_of(vm_detail::max_of(wanted, needed), max_size());
         VMManager& mgr = VMManager::instance();
         uint16_t page = vm_detail::kNoPage;
         uint16_t offset = 0;
@@ -1650,7 +1650,7 @@ private:
         if (has_block()) mgr.heap_free(_page, _offset);
         _page = page;
         _offset = offset;
-        _capacity = vm_detail::min<size_type>(usable - 1, max_size());
+        _capacity = vm_detail::min_of<size_type>(usable - 1, max_size());
         return true;
     }
 
@@ -1660,7 +1660,7 @@ private:
      */
     char* open_gap(size_type pos, size_type count, size_type gap_len) {
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return nullptr; }
-        count = vm_detail::min(count, _size - pos);
+        count = vm_detail::min_of(count, _size - pos);
 
         const size_type new_size = _size - count + gap_len;
         if (new_size == 0 && !has_block()) return nullptr; // stays empty
@@ -1682,7 +1682,7 @@ private:
 
     size_type find_backward(const char* set, size_type pos, bool in_set) const {
         const char* b = c_str();
-        for (size_type i = vm_detail::min(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
+        for (size_type i = vm_detail::min_of(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
             if ((strchr(set, b[i]) != nullptr) == in_set) return i;
         return npos;
     }

@@ -188,6 +188,14 @@ static void test_copy_vector() {
     b[0] = 42;
     CHECK(a[0] == 0 && b[0] == 42);
     CHECK(b.size() == 10 && b[9] == 9);
+
+    // Two ints mean "count, value", not an iterator range.
+    b.assign(4, 1);
+    CHECK(b.size() == 4 && b[0] == 1 && b[3] == 1);
+
+    int raw[] = {5, 6, 7};
+    b.assign(raw, raw + 3);
+    CHECK(b.size() == 3 && b[2] == 7);
 }
 
 static void test_out_of_pages_reports_error() {
@@ -488,6 +496,25 @@ static void test_pin_string_and_ptr() {
     person.destroy();
 }
 
+static void test_pinned_nested_container_grows() {
+    if (PINNABLE == 0) return;
+    VMVector<VMVector<long> > rows;
+    rows.emplace_back();
+    rows.emplace_back();
+    const long n = long(INTS_PER_PAGE) * long(VM_RESIDENT_PAGES) * 2; // goes paged
+    {
+        VMPin<VMVector<long> > row(rows[1]);
+        CHECK(row.valid());
+        for (long i = 0; i < n; ++i) row->push_back(i * 2);
+    }
+    CHECK(rows[0].empty());
+    CHECK(rows[1].size() == size_t(n));
+    size_t wrong = 0;
+    for (long i = 0; i < n; ++i)
+        if (rows[1][i] != i * 2) wrong++;
+    CHECK(wrong == 0);
+}
+
 static void test_pin_outside_virtual_memory() {
     int local = 5;
     VMPin<int> p(local);
@@ -575,6 +602,7 @@ int main() {
         {"write after flush is saved", test_write_after_flush_is_saved},
         {"too many pins", test_too_many_pins},
         {"pin string and ptr", test_pin_string_and_ptr},
+        {"pinned nested container grows", test_pinned_nested_container_grows},
         {"pin outside virtual memory", test_pin_outside_virtual_memory},
 #if VM_USE_STL
         {"STL algorithms", test_stl_algorithms},

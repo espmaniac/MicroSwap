@@ -26,7 +26,43 @@ Any Arduino core with a C++11 compiler. The library uses neither exceptions nor 
 
 ## Installation
 
-Download the repository as a ZIP and use *Sketch → Include Library → Add .ZIP Library* in the Arduino IDE, or clone it into your `libraries/` folder. With PlatformIO, add the repository URL to `lib_deps`.
+**Arduino IDE.** Download the repository as a ZIP (*Code → Download ZIP* on GitHub) and use *Sketch → Include Library → Add .ZIP Library*. The examples also need the `SD` library, which comes with the IDE; ESP and RP2040 cores have their own.
+
+**PlatformIO.** Add the library to `platformio.ini`:
+
+```ini
+[env:uno]
+platform = atmelavr
+board = uno
+framework = arduino
+lib_deps =
+    https://github.com/espmaniac/MicroSwap.git
+    arduino-libraries/SD    ; for the examples; not needed on ESP32 / ESP8266 / RP2040
+```
+
+To change the configuration, use build flags so that every file sees the same values:
+
+```ini
+build_flags = -DVM_RESIDENT_PAGES=4
+```
+
+**Arduino CLI.** `arduino-cli lib install --git-url https://github.com/espmaniac/MicroSwap.git` (needs `library.enable_unsafe_install` set to `true`).
+
+## Examples
+
+| Example | Shows |
+|---|---|
+| [Basic](examples/Basic/Basic.ino) | A vector bigger than RAM, a string, swap statistics |
+| [Vector](examples/Vector/Vector.ino) | Every `VMVector` operation: insert, erase, iterators, flat and paged storage, resize, copy, swap, compare |
+| [Array](examples/Array/Array.ino) | `VMArray` as a global, arrays of structs, fill, copy, iterators |
+| [String](examples/String/String.ino) | Building, searching, extracting, editing and comparing `VMString` |
+| [Pointer](examples/Pointer/Pointer.ino) | `make_vm`, `VMPtr` as a long-lived object used from `loop()`, `destroy()` |
+| [Pin](examples/Pin/Pin.ino) | Keeping references with `VMPin`, changing a container stored inside a container |
+| [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
+| [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
+| [CustomStorage](examples/CustomStorage/CustomStorage.ino) | Swapping to an SPI SRAM chip by implementing `VMStorage` |
+
+All examples except CustomStorage put the swap file on an SD card, through `SwapFile.h` in the example's folder. Set `SD_CS_PIN` there to your card's chip select pin.
 
 ## Quick start
 
@@ -55,7 +91,7 @@ void setup() {
 void loop() {}
 ```
 
-See [`examples/Basic`](examples/Basic/Basic.ino) for a sketch that picks the right file system on each board, and [`examples/Algorithms`](examples/Algorithms/Algorithms.ino) for `<algorithm>` usage.
+`SwapFile.h` in [`examples/Basic`](examples/Basic) opens the swap file the right way on each board; see [Examples](#examples) for the rest.
 
 ### Opening the swap file
 
@@ -133,6 +169,13 @@ for (size_t i = 0; i < v.size(); ++i) total += v[i];
 ```
 
 The containers need 3 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 3` different pages can be pinned at once; pins on the same page count once. On AVR the default is 3 resident pages, so set `VM_RESIDENT_PAGES` to 4 to pin one page (128 more bytes of RAM). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
+
+**Pin the outer object when changing a nested container.** A container stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors, keeps its own fields in a page. An operation that touches several other pages (growing a string, `reserve()`, `resize()`, `assign()`) can swap that page out halfway through. Until the library handles this itself, pin the outer element first:
+
+```cpp
+VMPin<Person> person(people[i]);
+person->name.append(suffix);
+```
 
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 

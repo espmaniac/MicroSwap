@@ -1,0 +1,71 @@
+{
+  "name": "MicroSwap",
+  "version": "0.2.0",
+  "description": "Virtual memory with a swap file and STL-like containers (vector, array, string, pointer) for boards with little RAM. Keeps a few pages in RAM and swaps the rest to an SD card or other storage.",
+  "keywords": ["virtual memory", "swap", "sd", "vector", "string", "containers", "memory"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/espmaniac/MicroSwap.git"
+  },
+  "authors": [
+    {
+      "name": "espmaniac",
+      "maintainer": true
+    }
+  ],
+  "license": "Unlicense",
+  "homepage": "https://github.com/espmaniac/MicroSwap",
+  "frameworks": "arduino",
+  "platforms": "*",
+  "headers": "MicroSwap.h",
+  "export": {
+    "exclude": ["tests", ".github"]
+  },
+  "examples": [
+    {
+      "name": "Basic",
+      "base": "examples/Basic",
+      "files": ["Basic.ino", "SwapFile.h"]
+    },
+    {
+      "name": "Vector",
+      "base": "examples/Vector",
+      "files": ["Vector.ino", "SwapFile.h"]
+    },
+    {
+      "name": "Array",
+      "base": "examples/Array",
+      "files": ["Array.ino", "SwapFile.h"]
+    },
+    {
+      "name": "String",
+      "base": "examples/String",
+      "files": ["String.ino", "SwapFile.h"]
+    },
+    {
+      "name": "Pointer",
+      "base": "examples/Pointer",
+      "files": ["Pointer.ino", "SwapFile.h"]
+    },
+    {
+      "name": "Pin",
+      "base": "examples/Pin",
+      "files": ["Pin.ino", "SwapFile.h"]
+    },
+    {
+      "name": "ErrorHandling",
+      "base": "examples/ErrorHandling",
+      "files": ["ErrorHandling.ino", "SwapFile.h"]
+    },
+    {
+      "name": "Algorithms",
+      "base": "examples/Algorithms",
+      "files": ["Algorithms.ino", "Person.h", "SwapFile.h"]
+    },
+    {
+      "name": "CustomStorage",
+      "base": "examples/CustomStorage",
+      "files": ["CustomStorage.ino", "SpiRamStorage.h"]
+    }
+  ]
+}

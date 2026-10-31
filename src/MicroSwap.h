@@ -345,7 +345,11 @@ private:
 };
 
 // Forward declarations for friend declarations
-namespace vm_detail { class KeepResident; }
+class VMManager;
+namespace vm_detail {
+class KeepResident;
+template<typename> struct ManagerStorage;
+}
 template<typename T> class VMPtr;
 template<typename T> class VMPin;
 template<typename T> class VMVector;
@@ -365,10 +369,7 @@ class VMString;
  */
 class VMManager {
 public:
-    static VMManager& instance() {
-        static VMManager inst;
-        return inst;
-    }
+    static VMManager& instance();
 
     /**
      * @brief Start using the given swap storage. Discards all previous data.
@@ -397,7 +398,7 @@ public:
         if (!_started) return false;
         bool ok = true;
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
-            if (_frames[f].page == vm_detail::kNoPage) continue;
+            if (page_in(f) == vm_detail::kNoPage) continue;
             const bool handed_out = _frames[f].written != vm_detail::Access::Read;
             ok = save_frame(f) && ok;
             // References (and pins) obtained before the flush may still be
@@ -412,9 +413,7 @@ public:
     void clear_error() { _last_error = VMError::None; }
 
     /// Set the error handler (nullptr restores the default, which calls abort()).
-    void set_error_handler(VMErrorHandler handler) {
-        _handler = handler ? handler : vm_default_error_handler;
-    }
+    void set_error_handler(VMErrorHandler handler) { _handler = handler; }
 
     size_t get_page_size() const { return VM_PAGE_SIZE; }
     size_t get_page_count() const { return VM_PAGE_COUNT; }
@@ -449,8 +448,8 @@ private:
 
     /// Per virtual page bookkeeping (kept in RAM).
     struct PageEntry {
-        uint8_t  flags;        ///< PAGE_* bits.
-        uint8_t  frame;        ///< Resident page holding it, or kNoFrame.
+        uint8_t  flags;         ///< PAGE_* bits.
+        uint8_t  slot_plus_one; ///< Resident slot + 1, or 0 if not in RAM. Use slot_of().
         union {
             uint16_t heap_largest; ///< Heap pages: largest free block, so full pages are skipped without loading them.
             uint16_t next_chunk;   ///< VMVector pages: next page of the same vector, or kNoPage.
@@ -459,43 +458,72 @@ private:
 
     /// A resident page slot in RAM.
     struct Frame {
-        uint16_t          page;     ///< Virtual page stored here, or kNoPage.
-        vm_detail::Access written;  ///< Strongest access since the page was loaded or saved.
-        uint8_t           pins;     ///< Live VMPins; a pinned page is never evicted.
-        vm_detail::Tick   last_use; ///< Access tick, for least-recently-used eviction.
+        uint16_t          page_plus_one; ///< Virtual page + 1, or 0 if the slot is free. Use page_in().
+        vm_detail::Access written;       ///< Strongest access since the page was loaded or saved.
+        uint8_t           pins;          ///< Live VMPins; a pinned page is never evicted.
+        vm_detail::Tick   last_use;      ///< Access tick, for least-recently-used eviction.
     };
 
-    VMStorage*     _storage = nullptr;
-    bool           _started = false;
-    VMError        _last_error = VMError::None;
-    VMErrorHandler _handler = vm_default_error_handler;
+    // All zeros is the valid "not started" state, and the constexpr
+    // constructor below sets exactly that. The one VMManager is therefore
+    // constant-initialized: it exists before any code runs, so it is usable
+    // from constructors of other global objects whatever order they run in,
+    // and instance() needs no "already constructed?" check.
+    VMStorage*      _storage;
+    bool            _started;
+    VMError         _last_error;   ///< VMError::None is 0.
+    VMErrorHandler  _handler;      ///< nullptr means vm_default_error_handler.
 
-    vm_detail::Tick _tick = 0;
-    uint32_t _storage_size = 0; ///< Bytes known to exist in the storage.
-    uint32_t _swap_ins = 0;
-    uint32_t _swap_outs = 0;
+    vm_detail::Tick _tick;
+    uint32_t        _storage_size; ///< Bytes known to exist in the storage.
+    uint32_t        _swap_ins;
+    uint32_t        _swap_outs;
 
     PageEntry _pages[VM_PAGE_COUNT];
     Frame     _frames[VM_RESIDENT_PAGES];
     alignas(VM_HEAP_ALIGN) uint8_t _frame_data[VM_RESIDENT_PAGES][VM_PAGE_SIZE];
 
-    VMManager() { reset_tables(); }
+    template<typename> friend struct vm_detail::ManagerStorage;
+    constexpr VMManager()
+        : _storage(nullptr), _started(false), _last_error(VMError::None), _handler(nullptr),
+          _tick(0), _storage_size(0), _swap_ins(0), _swap_outs(0),
+          _pages(), _frames(), _frame_data() {}
     VMManager(const VMManager&) = delete;
     VMManager& operator=(const VMManager&) = delete;
 
     void fail(VMError error) {
         _last_error = error;
-        _handler(error);
+        (_handler ? _handler : vm_default_error_handler)(error);
+    }
+
+    // Pages and slots are stored + 1 so that zero means "none" (see above).
+
+    /// Resident slot holding a page, or kNoFrame.
+    uint8_t slot_of(uint16_t page) const {
+        const uint8_t v = _pages[page].slot_plus_one;
+        return v == 0 ? uint8_t(vm_detail::kNoFrame) : uint8_t(v - 1);
+    }
+    void set_slot_of(uint16_t page, uint8_t f) {
+        _pages[page].slot_plus_one = f == vm_detail::kNoFrame ? uint8_t(0) : uint8_t(f + 1);
+    }
+
+    /// Page held by a resident slot, or kNoPage.
+    uint16_t page_in(uint8_t f) const {
+        const uint16_t v = _frames[f].page_plus_one;
+        return v == 0 ? uint16_t(vm_detail::kNoPage) : uint16_t(v - 1);
+    }
+    void set_page_in(uint8_t f, uint16_t page) {
+        _frames[f].page_plus_one = page == vm_detail::kNoPage ? uint16_t(0) : uint16_t(page + 1);
     }
 
     void reset_tables() {
         for (uint16_t p = 0; p < VM_PAGE_COUNT; ++p) {
             _pages[p].flags = 0;
-            _pages[p].frame = vm_detail::kNoFrame;
+            set_slot_of(p, vm_detail::kNoFrame);
             _pages[p].heap_largest = 0;
         }
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
-            _frames[f].page = vm_detail::kNoPage;
+            set_page_in(f, vm_detail::kNoPage);
             _frames[f].written = vm_detail::Access::Read;
             _frames[f].pins = 0;
             _frames[f].last_use = 0;
@@ -540,14 +568,14 @@ private:
     /// Release a page. Its contents are discarded, not written to storage.
     void free_page(uint16_t page) {
         if (!is_allocated(page)) return;
-        uint8_t f = _pages[page].frame;
+        const uint8_t f = slot_of(page);
         if (f != vm_detail::kNoFrame) {
-            _frames[f].page = vm_detail::kNoPage;
+            set_page_in(f, vm_detail::kNoPage);
             _frames[f].written = vm_detail::Access::Read;
             _frames[f].pins = 0;
         }
         _pages[page].flags = 0;
-        _pages[page].frame = vm_detail::kNoFrame;
+        set_slot_of(page, vm_detail::kNoFrame);
         _pages[page].heap_largest = 0;
     }
 
@@ -559,12 +587,13 @@ private:
      */
     uint8_t* page_ptr(uint16_t page, vm_detail::Access access) {
         if (!is_allocated(page)) return nullptr;
-        if (_pages[page].frame == vm_detail::kNoFrame) load_page(page);
+        if (slot_of(page) == vm_detail::kNoFrame) load_page(page);
 
-        Frame& frame = _frames[_pages[page].frame];
+        const uint8_t f = slot_of(page);
+        Frame& frame = _frames[f];
         frame.last_use = next_tick();
         if (access > frame.written) frame.written = access;
-        return _frame_data[_pages[page].frame];
+        return _frame_data[f];
     }
 
     /// Pointer to a byte offset inside a page (see page_ptr()).
@@ -574,10 +603,10 @@ private:
     }
 
     void attach(uint16_t page, uint8_t f) {
-        _frames[f].page = page;
+        set_page_in(f, page);
         _frames[f].written = vm_detail::Access::Read;
         _frames[f].last_use = next_tick();
-        _pages[page].frame = f;
+        set_slot_of(page, f);
     }
 
     /**
@@ -629,7 +658,7 @@ private:
     uint8_t acquire_frame() {
         uint8_t victim = vm_detail::kNoFrame;
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
-            if (_frames[f].page == vm_detail::kNoPage) return f;
+            if (page_in(f) == vm_detail::kNoPage) return f;
             if (_frames[f].pins > 0) continue;
             if (victim == vm_detail::kNoFrame || _frames[f].last_use < _frames[victim].last_use) victim = f;
         }
@@ -642,8 +671,8 @@ private:
         }
 
         save_frame(victim);
-        _pages[_frames[victim].page].frame = vm_detail::kNoFrame;
-        _frames[victim].page = vm_detail::kNoPage;
+        set_slot_of(page_in(victim), vm_detail::kNoFrame);
+        set_page_in(victim, vm_detail::kNoPage);
         _frames[victim].written = vm_detail::Access::Read;
         return victim;
     }
@@ -663,7 +692,7 @@ private:
             return true;
         }
 
-        const uint32_t offset = storage_offset(_frames[f].page);
+        const uint32_t offset = storage_offset(page_in(f));
         bool ok = extend_storage(offset) && _storage->write(offset, _frame_data[f], VM_PAGE_SIZE);
         if (!ok) { fail(VMError::StorageIO); return false; }
 
@@ -676,7 +705,7 @@ private:
     /// True if the resident copy of a page equals the copy in storage.
     bool same_as_storage(uint8_t f) {
         uint8_t chunk[32];
-        const uint32_t offset = storage_offset(_frames[f].page);
+        const uint32_t offset = storage_offset(page_in(f));
         for (size_t pos = 0; pos < VM_PAGE_SIZE; pos += sizeof(chunk)) {
             const size_t n = vm_detail::min_of(sizeof(chunk), size_t(VM_PAGE_SIZE - pos));
             if (!_storage->read(offset + pos, chunk, n)) return false;
@@ -727,7 +756,7 @@ private:
      */
     void touch(const void* address) {
         const uint8_t f = frame_of(address);
-        if (f != vm_detail::kNoFrame && _frames[f].page != vm_detail::kNoPage) _frames[f].last_use = next_tick();
+        if (f != vm_detail::kNoFrame && page_in(f) != vm_detail::kNoPage) _frames[f].last_use = next_tick();
     }
 
     uint8_t pinned_frames() const {
@@ -744,7 +773,7 @@ private:
      */
     uint8_t pin(const void* address) {
         const uint8_t f = frame_of(address);
-        if (f == vm_detail::kNoFrame || _frames[f].page == vm_detail::kNoPage) return vm_detail::kNoFrame;
+        if (f == vm_detail::kNoFrame || page_in(f) == vm_detail::kNoPage) return vm_detail::kNoFrame;
         const int unpinned_after = VM_RESIDENT_PAGES - pinned_frames() - (_frames[f].pins == 0 ? 1 : 0);
         if (unpinned_after < kMinUnpinned || _frames[f].pins == 0xFF) {
             fail(VMError::TooManyPins);
@@ -762,7 +791,7 @@ private:
      */
     uint8_t pin_internal(const void* address) {
         const uint8_t f = frame_of(address);
-        if (f == vm_detail::kNoFrame || _frames[f].page == vm_detail::kNoPage) return vm_detail::kNoFrame;
+        if (f == vm_detail::kNoFrame || page_in(f) == vm_detail::kNoPage) return vm_detail::kNoFrame;
         const bool last_unpinned = _frames[f].pins == 0 && pinned_frames() + 1 >= VM_RESIDENT_PAGES;
         if (last_unpinned || _frames[f].pins == 0xFF) {
             fail(VMError::TooManyPins);
@@ -789,7 +818,7 @@ private:
 
     /// Undo pin() or pin_internal(). Ignored if the page was freed in the meantime.
     void unpin(uint8_t f, uint16_t page) {
-        if (f >= VM_RESIDENT_PAGES || _frames[f].page != page || _frames[f].pins == 0) return;
+        if (f >= VM_RESIDENT_PAGES || page_in(f) != page || _frames[f].pins == 0) return;
         _frames[f].pins--;
     }
 
@@ -899,6 +928,28 @@ private:
 namespace vm_detail {
 
 /**
+ * @brief Holds the one VMManager.
+ *
+ * A static member of a class template can be defined in a header and still
+ * exists only once in the program (C++11 has no inline variables). Its
+ * constructor is constexpr, so the object is initialized at compile time:
+ * nothing runs at startup and no initialization order can go wrong.
+ */
+template<typename Unused = void>
+struct ManagerStorage {
+    static VMManager manager;
+};
+
+template<typename Unused>
+VMManager ManagerStorage<Unused>::manager;
+
+} // namespace vm_detail
+
+inline VMManager& VMManager::instance() { return vm_detail::ManagerStorage<>::manager; }
+
+namespace vm_detail {
+
+/**
  * @brief Keeps the pages holding the given objects in RAM for one container
  *        operation: the container itself and the objects passed to it.
  *
@@ -940,7 +991,7 @@ private:
         const uint8_t f = mgr.pin_internal(address);
         if (f == kNoFrame) return;
         _frames[_count] = f;
-        _pages[_count] = mgr._frames[f].page;
+        _pages[_count] = mgr.page_in(f);
         _count++;
     }
 };
@@ -1092,7 +1143,7 @@ public:
 
 private:
     static uint16_t page_of(uint8_t frame) {
-        return frame == vm_detail::kNoFrame ? uint16_t(vm_detail::kNoPage) : VMManager::instance()._frames[frame].page;
+        return frame == vm_detail::kNoFrame ? uint16_t(vm_detail::kNoPage) : VMManager::instance().page_in(frame);
     }
 
     T*       _object;

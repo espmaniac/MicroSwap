@@ -26,6 +26,7 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - `VMVector` no longer allocates a page table with `malloc`: its pages are linked through the page table that `VMManager` already has, and the last page looked up is remembered, so sequential access stays fast. Without SD, a sketch using `VMVector` is about 700 bytes smaller on AVR. `VMError::OutOfMemory` was removed.
 - `VMStorage` has a protected, non-virtual destructor, so that no `operator delete` (and with it `malloc`) is linked.
 - On AVR the least-recently-used counter is 16 bits (`VM_TICK_BITS`), renumbered before it overflows: about 260 bytes less flash and 10 bytes less RAM on an Uno.
+- The `VMManager` is a constant-initialized static object instead of a function-local static, so `instance()` has no "already constructed?" check and is inlined: about 270–440 bytes less flash and 8 bytes less RAM on an Uno. It is valid before any code runs, so global objects may use it from their constructors.
 
 ### Fixed
 - `reserve()` before `push_back()` shifted elements by one page.

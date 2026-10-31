@@ -59,6 +59,25 @@ private:
     std::vector<uint8_t> _data;
 };
 
+// ---- Global objects, constructed before main() ----
+// The VMManager is zero-filled static memory, so it is valid even while
+// other globals are being constructed, whatever order that happens in.
+
+struct UsesManagerAtStartup {
+    size_t free_pages;
+    size_t page_count;
+    VMError error;
+    UsesManagerAtStartup()
+        : free_pages(VMManager::instance().free_pages()),
+          page_count(VMManager::instance().get_page_count()),
+          error(VMManager::instance().last_error()) {}
+};
+static UsesManagerAtStartup g_startup;
+
+static VMVector<int> g_global_vector;
+static VMString g_global_string;
+static VMArray<int, 4> g_global_array;
+
 static RamStorage* g_storage = nullptr;
 static int g_errors = 0;
 
@@ -101,6 +120,23 @@ struct Person {
 };
 
 // -----------------------------------------------------------------------------
+
+static void test_manager_usable_before_main() {
+    CHECK(g_startup.free_pages == VM_PAGE_COUNT);
+    CHECK(g_startup.page_count == VM_PAGE_COUNT);
+    CHECK(g_startup.error == VMError::None);
+}
+
+static void test_global_containers() {
+    for (int i = 0; i < 300; ++i) g_global_vector.push_back(i);
+    g_global_string = "global";
+    g_global_array[2] = 7;
+    CHECK(g_global_vector[299] == 299);
+    CHECK(g_global_string == "global");
+    CHECK(g_global_array[2] == 7 && g_global_array[0] == 0);
+    g_global_vector.clear();
+    g_global_string.clear();
+}
 
 static void test_data_survives_swapping() {
     // Several times more data than fits in RAM.
@@ -1044,6 +1080,8 @@ int main() {
 
     struct Test { const char* name; void (*fn)(); };
     const Test tests[] = {
+        {"manager usable before main", test_manager_usable_before_main},
+        {"global containers", test_global_containers},
         {"data survives swapping", test_data_survives_swapping},
         {"reserve then push_back", test_reserve_then_push_back},
         {"small vector stays flat", test_small_vector_stays_flat},

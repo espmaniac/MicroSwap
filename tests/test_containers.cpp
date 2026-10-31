@@ -4,6 +4,12 @@
 // with an AVR-like one (C++11, no STL, tiny pages) where pages are swapped
 // out all the time.
 
+// Count VM_YIELD() calls (see test_yields_on_every_page_transfer).
+static unsigned long g_yields = 0;
+#ifndef VM_YIELD
+#define VM_YIELD() (++g_yields)
+#endif
+
 #include "../src/MicroSwap.h"
 
 #include <cstdio>
@@ -472,6 +478,19 @@ static void test_references_survive_counter_overflow() {
         if (ref != int(a) || &ref != &v[a]) stale++;
     }
     CHECK(stale == 0);
+}
+
+static void test_yields_on_every_page_transfer() {
+    // Every page read from or written to storage gives the system a turn
+    // (on ESP8266 this keeps Wi-Fi and the watchdog alive).
+    g_yields = 0;
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3); ++i) v.push_back(int(i));
+    long long sum = 0;
+    for (size_t i = 0; i < v.size(); ++i) sum += v[i];
+    CHECK(sum > 0);
+    CHECK(vm().swap_in_count() > 0 && vm().swap_out_count() > 0);
+    CHECK(g_yields >= vm().swap_in_count() + vm().swap_out_count());
 }
 
 static void test_storage_flushed_only_by_flush_all() {
@@ -1153,6 +1172,7 @@ int main() {
         {"reading does not write pages", test_reading_does_not_write_pages},
         {"writes through references are saved", test_writes_through_references_are_saved},
         {"references survive counter overflow", test_references_survive_counter_overflow},
+        {"yields on every page transfer", test_yields_on_every_page_transfer},
         {"storage flushed only by flush_all", test_storage_flushed_only_by_flush_all},
         {"pin keeps reference valid", test_pin_keeps_reference_valid},
         {"write after flush is saved", test_write_after_flush_is_saved},

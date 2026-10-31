@@ -24,11 +24,31 @@ jobs:
           - fqbn: arduino:renesas_uno:minima
             platforms: |
               - name: arduino:renesas_uno
+          - fqbn: arduino:megaavr:nona4809
+            platforms: |
+              - name: arduino:megaavr
+          - fqbn: arduino:sam:arduino_due_x_dbg
+            platforms: |
+              - name: arduino:sam
+          - fqbn: arduino:mbed_nano:nano33ble
+            platforms: |
+              - name: arduino:mbed_nano
+          - fqbn: arduino:mbed_nano:nanorp2040connect
+            platforms: |
+              - name: arduino:mbed_nano
+          - fqbn: teensy:avr:teensy41
+            platforms: |
+              - name: teensy:avr
+                source-url: https://www.pjrc.com/teensy/package_teensy_index.json
           - fqbn: esp32:esp32:esp32
             platforms: |
               - name: esp32:esp32
                 source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
           - fqbn: esp32:esp32:esp32c3
+            platforms: |
+              - name: esp32:esp32
+                source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          - fqbn: esp32:esp32:esp32s3
             platforms: |
               - name: esp32:esp32
                 source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json

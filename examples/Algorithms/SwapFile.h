@@ -8,7 +8,7 @@
 
 #include <MicroSwap.h>
 
-#if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
+#if defined(ESP8266) || (defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED))
 #include <SDFS.h>
 #else
 #include <SPI.h>
@@ -24,7 +24,7 @@ static VMFileStorage<File> swapStorage(swapFile);
 
 /// Mount the SD card, open the swap file for reading and writing, and start MicroSwap.
 inline bool beginSwap(const char* path = "/swap.bin") {
-#if defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)
+#if defined(ESP8266) || (defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED))
     SDFS.setConfig(SDFSConfig(SD_CS_PIN));
     if (!SDFS.begin()) return false;
     swapFile = SDFS.open(path, "w+");

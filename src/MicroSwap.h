@@ -40,6 +40,10 @@
 #    include <new>
 #  else
 #    include <new.h>
+#    if defined(ARDUINO_ARCH_MEGAAVR)
+// The megaAVR core's <new.h> has no placement new.
+inline void* operator new(size_t, void* place) noexcept { return place; }
+#    endif
 #  endif
 #else
 #  include <new>

@@ -26,7 +26,8 @@
  * and evict it; at least (VM_RESIDENT_PAGES - 1) other pages can be touched
  * safely. Use a reference right away, or hold a VMPin while you keep it.
  *
- * Not thread-safe.
+ * Not thread-safe. All containers share one VMManager, so tasks need one
+ * lock for the whole library, held for as long as they use references.
  */
 
 #include <stddef.h>

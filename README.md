@@ -188,7 +188,26 @@ An operation needs up to 4 resident pages at once. Deeper nesting, or an operati
 
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 
-**Not thread-safe.** Use it from one task only, or protect it with a mutex.
+**Several tasks (ESP32, RP2040, FreeRTOS).** The library is not thread-safe, and two things matter when more than one task uses it:
+
+- *Use one lock for the whole library, not one per container.* All containers share the same `VMManager`: its page table, its pages in RAM and its usage counter. Two tasks working on two different vectors still change the same tables at the same time.
+- *Keep the lock while you use references.* `v[i]`, `*it` and `c_str()` point into a page in RAM, and another task can swap that page out. Taking the lock only around each call is not enough: hold it from getting a reference until you are done with it.
+
+```cpp
+SemaphoreHandle_t vmLock = xSemaphoreCreateMutex(); // one for all containers
+
+void worker(void*) {
+    for (;;) {
+        xSemaphoreTake(vmLock, portMAX_DELAY);
+        long& x = values[0];   // valid only while the lock is held
+        x += 1;
+        xSemaphoreGive(vmLock);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+The library does not lock by itself: a lock per call would cost every element access time without making references safe.
 
 **Data does not survive a reset.** `begin()` starts with empty memory.
 

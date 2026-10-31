@@ -125,47 +125,389 @@ v[0] = 5;                                          // right
 
 **Data does not survive a reset.** `begin()` starts with empty memory.
 
-## API overview
+## API reference
+
+Every public member, written as class declarations. Only behavior that differs from the standard C++ library is commented. All containers allocate memory on first use, so they can be global variables created before `VMManager::begin()`.
+
+### Errors
 
 ```cpp
-// Manager
-VMManager& vm = VMManager::instance();
-bool     begin(VMStorage& storage);
-void     end();
-bool     flush_all();                  // write modified pages to storage
-VMError  last_error() const;
-void     clear_error();
-void     set_error_handler(VMErrorHandler handler);
-size_t   get_page_size() const;
-size_t   get_page_count() const;
-size_t   get_resident_pages() const;
-size_t   free_pages() const;
-uint32_t swap_in_count() const;
-uint32_t swap_out_count() const;
+enum class VMError : uint8_t {
+    None,
+    NotStarted,   // VMManager::begin() has not been called
+    OutOfPages,   // every virtual page is in use
+    TooLarge,     // the object does not fit in one page
+    OutOfMemory,  // malloc failed (VMVector chunk table)
+    StorageIO,    // reading or writing the swap file failed
+    OutOfRange,   // index out of range: at(), front()/back()/pop_back() on empty, ...
+    NullPointer,  // a null VMPtr was dereferenced
+};
 
-// VMVector<T>: std::vector-like
-push_back, emplace_back, pop_back, insert, emplace, erase, clear, resize,
-reserve, shrink_to_fit, assign, swap, operator[], at, front, back, size,
-capacity, empty, begin/end, rbegin/rend, comparison operators
-bool is_flat() const;   // true while all elements are in one block
-T*   data();            // contiguous storage while is_flat(), otherwise nullptr
+typedef void (*VMErrorHandler)(VMError error);
 
-// VMArray<T, N>: std::array-like
-operator[], at, front, back, size, empty, fill, clear, begin/end, rbegin/rend
-
-// VMString: std::string-like
-c_str, size, length, capacity, max_size, reserve, resize, clear, assign,
-append, operator+=, push_back, pop_back, insert, erase, replace, substr, copy,
-swap, find, rfind, find_first_of, find_last_of, find_first_not_of,
-find_last_not_of, compare, comparison operators, operator+
-
-// VMPtr<T>
-VMPtr<Person> p = make_vm<Person>(28, "oscar");  // null VMPtr on failure
-p->age++;
-p.destroy();                                      // objects live until destroy()
+const char* vm_error_name(VMError error);   // "OutOfPages", ...
+void vm_default_error_handler(VMError);     // calls abort()
 ```
 
-Containers allocate memory on first use, so they can be global variables created before `begin()`.
+### Swap storage
+
+```cpp
+// Interface: implement it to store pages anywhere.
+class VMStorage {
+public:
+    virtual ~VMStorage();
+    virtual bool read(uint32_t offset, uint8_t* buf, size_t len) = 0;
+    virtual bool write(uint32_t offset, const uint8_t* buf, size_t len) = 0;
+};
+
+// Storage on any Arduino File with seek(), read(), write() and flush().
+// The file must be open for reading and writing and stay open.
+template<class FileT>
+class VMFileStorage : public VMStorage {
+public:
+    explicit VMFileStorage(FileT& file);
+    bool read(uint32_t offset, uint8_t* buf, size_t len) override;
+    bool write(uint32_t offset, const uint8_t* buf, size_t len) override;   // flushes after each write
+};
+```
+
+### VMManager
+
+```cpp
+class VMManager {
+public:
+    static VMManager& instance();
+
+    bool begin(VMStorage& storage);   // discards all previous data
+    void end();                       // discards all pages, writes nothing
+    bool flush_all();                 // writes modified resident pages; false if a write failed
+
+    VMError last_error() const;       // last error since begin() or clear_error()
+    void clear_error();
+    void set_error_handler(VMErrorHandler handler);   // nullptr restores the default (abort())
+
+    size_t get_page_size() const;       // VM_PAGE_SIZE
+    size_t get_page_count() const;      // VM_PAGE_COUNT
+    size_t get_resident_pages() const;  // VM_RESIDENT_PAGES
+    size_t free_pages() const;          // virtual pages not in use
+    uint32_t swap_in_count() const;     // pages loaded from storage since begin()
+    uint32_t swap_out_count() const;    // pages written to storage since begin()
+};
+```
+
+### VMPtr
+
+```cpp
+// Pointer to one object in virtual memory. Copies point to the same object,
+// like a raw pointer; the object lives until destroy().
+template<class T>
+class VMPtr {
+public:
+    VMPtr();                          // null
+    bool valid() const;               // false if null
+    explicit operator bool() const;
+
+    T& operator*();                   // null -> VMError::NullPointer
+    const T& operator*() const;
+    T* operator->();
+    const T* operator->() const;
+    T* get();                         // pointer into a resident page, see "Rules to follow"
+    const T* get() const;
+
+    void destroy();                   // runs ~T(), frees storage, becomes null
+
+    bool operator==(const VMPtr& other) const;
+    bool operator!=(const VMPtr& other) const;
+};
+
+// Like std::make_unique. Returns a null VMPtr if allocation fails.
+template<class T, class... Args>
+VMPtr<T> make_vm(Args&&... args);
+```
+
+### VMVector
+
+```cpp
+template<class T>
+class VMVector {
+public:
+    typedef T         value_type;
+    typedef T&        reference;
+    typedef const T&  const_reference;
+    typedef size_t    size_type;
+    typedef ptrdiff_t difference_type;
+    using iterator               = /* random-access; it.pos() returns the index */;
+    using const_iterator         = /* random-access; it.pos() returns the index */;
+    using reverse_iterator       = /* ... */;
+    using const_reverse_iterator = /* ... */;
+
+    VMVector();
+    explicit VMVector(size_type n, const T& value = T());
+    VMVector(std::initializer_list<T> init);   // only where the STL exists (not AVR)
+    VMVector(const VMVector& other);
+    VMVector(VMVector&& other) noexcept;
+    VMVector& operator=(const VMVector& other);
+    VMVector& operator=(VMVector&& other) noexcept;
+    ~VMVector();
+
+    // Element access
+    reference       operator[](size_type i);
+    const_reference operator[](size_type i) const;
+    reference       at(size_type i);           // differs: out of range -> VMError::OutOfRange, no exception
+    const_reference at(size_type i) const;
+    reference       front();                   // differs: checked, empty -> VMError::OutOfRange
+    const_reference front() const;
+    reference       back();                    // differs: checked, empty -> VMError::OutOfRange
+    const_reference back() const;
+    T*       data();                           // differs: nullptr unless is_flat()
+    const T* data() const;
+
+    // Capacity
+    bool      empty() const;
+    size_type size() const;
+    size_type capacity() const;
+    bool      is_flat() const;                 // differs: true while all elements are in one heap block
+    void      reserve(size_type n);
+    void      shrink_to_fit();                 // differs: releases unused pages; no-op while is_flat()
+
+    // Modifiers (on failure the error handler is called and nothing changes)
+    void push_back(const T& value);
+    void push_back(T&& value);
+    template<class... Args> reference emplace_back(Args&&... args);   // differs: placeholder on failure
+    template<class... Args> iterator emplace(const_iterator pos, Args&&... args);
+    iterator insert(const_iterator pos, const T& value);
+    iterator insert(const_iterator pos, T&& value);
+    iterator erase(const_iterator pos);
+    void pop_back();                           // differs: empty -> VMError::OutOfRange
+    void clear();                              // differs: also frees all storage
+    void resize(size_type n, const T& value = T());
+    void assign(size_type n, const T& value);
+    template<class InputIt> void assign(InputIt first, InputIt last);
+    void swap(VMVector& other);
+
+    // Iterators
+    iterator               begin();
+    iterator               end();
+    const_iterator         begin() const;
+    const_iterator         end() const;
+    const_iterator         cbegin() const;
+    const_iterator         cend() const;
+    reverse_iterator       rbegin();
+    reverse_iterator       rend();
+    const_reverse_iterator rbegin() const;
+    const_reverse_iterator rend() const;
+    const_reverse_iterator crbegin() const;
+    const_reverse_iterator crend() const;
+
+    // Comparisons
+    bool operator==(const VMVector& other) const;
+    bool operator!=(const VMVector& other) const;
+    bool operator<(const VMVector& other) const;
+    bool operator>(const VMVector& other) const;
+    bool operator<=(const VMVector& other) const;
+    bool operator>=(const VMVector& other) const;
+};
+```
+
+### VMArray
+
+```cpp
+// N * sizeof(T) must fit in one page (checked at compile time).
+template<class T, size_t N>
+class VMArray {
+public:
+    typedef T         value_type;
+    typedef T&        reference;
+    typedef const T&  const_reference;
+    typedef size_t    size_type;
+    typedef ptrdiff_t difference_type;
+    using iterator               = /* random-access; it.pos() returns the index */;
+    using const_iterator         = /* random-access; it.pos() returns the index */;
+    using reverse_iterator       = /* ... */;
+    using const_reverse_iterator = /* ... */;
+
+    VMArray();                                 // elements value-initialized (0 for int) on first access
+    VMArray(const VMArray& other);
+    VMArray(VMArray&& other) noexcept;
+    VMArray& operator=(const VMArray& other);
+    VMArray& operator=(VMArray&& other) noexcept;
+    ~VMArray();
+
+    reference       operator[](size_type i);
+    const_reference operator[](size_type i) const;
+    reference       at(size_type i);           // differs: out of range -> VMError::OutOfRange, no exception
+    const_reference at(size_type i) const;
+    reference       front();
+    const_reference front() const;
+    reference       back();
+    const_reference back() const;
+
+    constexpr size_type size() const;          // N
+    constexpr bool      empty() const;         // N == 0
+
+    void fill(const T& value);
+    void clear();                              // differs: not in std::array; assigns T() to every element
+
+    iterator               begin();
+    iterator               end();
+    const_iterator         begin() const;
+    const_iterator         end() const;
+    const_iterator         cbegin() const;
+    const_iterator         cend() const;
+    reverse_iterator       rbegin();
+    reverse_iterator       rend();
+    const_reverse_iterator rbegin() const;
+    const_reverse_iterator rend() const;
+    const_reverse_iterator crbegin() const;
+    const_reverse_iterator crend() const;
+};
+```
+
+### VMString
+
+```cpp
+// Stored in one heap block: at most max_size() characters. An empty string uses no memory.
+class VMString {
+public:
+    typedef char      value_type;
+    typedef char&     reference;
+    typedef const char& const_reference;
+    typedef size_t    size_type;
+    typedef ptrdiff_t difference_type;
+    using iterator               = /* random-access; it.pos() returns the index */;
+    using const_iterator         = /* random-access; it.pos() returns the index */;
+    using reverse_iterator       = /* ... */;
+    using const_reverse_iterator = /* ... */;
+
+    static const size_type npos = size_type(-1);
+
+    // Construction / assignment
+    VMString();
+    explicit VMString(size_type initial_capacity);   // differs: reserves capacity
+    VMString(const char* s);
+    VMString(const char* s, size_type count);
+    VMString(size_type count, char ch);
+    VMString(const VMString& other);
+    VMString(VMString&& other) noexcept;
+    VMString& operator=(const VMString& other);
+    VMString& operator=(VMString&& other) noexcept;
+    VMString& operator=(const char* s);
+    ~VMString();
+
+    // Iterators
+    iterator               begin();
+    iterator               end();
+    const_iterator         begin() const;
+    const_iterator         end() const;
+    const_iterator         cbegin() const;
+    const_iterator         cend() const;
+    reverse_iterator       rbegin();
+    reverse_iterator       rend();
+    const_reverse_iterator rbegin() const;
+    const_reverse_iterator rend() const;
+    const_reverse_iterator crbegin() const;
+    const_reverse_iterator crend() const;
+
+    // Element access (differs: every accessor is checked; out of range -> VMError::OutOfRange)
+    reference       operator[](size_type i);
+    const_reference operator[](size_type i) const;
+    reference       at(size_type i);
+    const_reference at(size_type i) const;
+    reference       front();
+    const_reference front() const;
+    reference       back();
+    const_reference back() const;
+    const char*     c_str() const;             // pointer into a resident page, see "Rules to follow"
+
+    // Capacity
+    bool      empty() const;
+    size_type size() const;
+    size_type length() const;
+    size_type capacity() const;
+    static constexpr size_type max_size();     // differs: one page minus a few bytes (123 on AVR)
+    void reserve(size_type new_cap);           // differs: beyond max_size() -> VMError::TooLarge
+    void shrink_to_fit();                      // differs: no-op
+    void resize(size_type n, char ch = '\0');
+    void clear();
+
+    // Modifiers (growing beyond max_size() -> VMError::TooLarge, string unchanged)
+    void assign(const char* s);                // differs: returns void
+    void assign(const char* s, size_type count);
+    void assign(size_type count, char ch);
+    void assign(const VMString& other, size_type pos, size_type count = npos);
+
+    VMString& append(const char* s);
+    VMString& append(const char* s, size_type count);
+    VMString& append(const VMString& other);
+    VMString& append(size_type count, char ch);
+    void push_back(char c);
+    void pop_back();                           // differs: empty -> VMError::OutOfRange
+
+    VMString& operator+=(const char* s);
+    VMString& operator+=(const VMString& s);
+    VMString& operator+=(char c);
+
+    VMString& insert(size_type pos, const char* s);
+    VMString& insert(size_type pos, const char* s, size_type count);
+    VMString& insert(size_type pos, const VMString& other);
+    VMString& insert(size_type pos, size_type count, char ch);
+
+    VMString& erase(size_type pos = 0, size_type count = npos);
+
+    VMString& replace(size_type pos, size_type count, const char* s, size_type s_count);
+    VMString& replace(size_type pos, size_type count, const char* s);
+    VMString& replace(size_type pos, size_type count, const VMString& other);
+
+    VMString  substr(size_type pos = 0, size_type count = npos) const;
+    size_type copy(char* dest, size_type count, size_type pos = 0) const;
+    void      swap(VMString& other);
+
+    // Search
+    size_type find(const char* s, size_type pos, size_type count) const;
+    size_type find(const char* s, size_type pos = 0) const;
+    size_type find(const VMString& other, size_type pos = 0) const;
+    size_type find(char ch, size_type pos = 0) const;
+
+    size_type rfind(const char* s, size_type pos, size_type count) const;
+    size_type rfind(const char* s, size_type pos = npos) const;
+    size_type rfind(const VMString& other, size_type pos = npos) const;
+    size_type rfind(char ch, size_type pos = npos) const;
+
+    size_type find_first_of(const char* s, size_type pos = 0) const;
+    size_type find_first_of(const VMString& other, size_type pos = 0) const;
+    size_type find_first_of(char ch, size_type pos = 0) const;
+
+    size_type find_first_not_of(const char* s, size_type pos = 0) const;
+    size_type find_first_not_of(const VMString& other, size_type pos = 0) const;
+    size_type find_first_not_of(char ch, size_type pos = 0) const;
+
+    size_type find_last_of(const char* s, size_type pos = npos) const;
+    size_type find_last_of(const VMString& other, size_type pos = npos) const;
+    size_type find_last_of(char ch, size_type pos = npos) const;
+
+    size_type find_last_not_of(const char* s, size_type pos = npos) const;
+    size_type find_last_not_of(const VMString& other, size_type pos = npos) const;
+    size_type find_last_not_of(char ch, size_type pos = npos) const;
+
+    // Comparison
+    int compare(const char* s, size_type s_len) const;
+    int compare(const char* s) const;
+    int compare(const VMString& other) const;
+
+    bool operator==(const VMString& other) const;
+    bool operator!=(const VMString& other) const;
+    bool operator<(const VMString& other) const;
+    bool operator>(const VMString& other) const;
+    bool operator<=(const VMString& other) const;
+    bool operator>=(const VMString& other) const;
+    bool operator==(const char* s) const;
+    bool operator!=(const char* s) const;
+};
+
+VMString operator+(const VMString& a, const VMString& b);
+VMString operator+(const VMString& a, const char* b);
+VMString operator+(const char* a, const VMString& b);
+```
 
 ## Running tests
 

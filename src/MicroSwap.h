@@ -13,6 +13,7 @@
  *  - VMArray<T,N> fixed-size array
  *  - VMString     mutable string
  *  - VMPtr<T>     pointer to one object, created with make_vm<T>(...)
+ *  - VMPin<T>     keeps the page of an object in RAM while a reference is in use
  *
  * Portability: needs only a C++11 compiler and the C standard library, so it
  * builds for AVR, ESP32, ESP8266, STM32, SAMD, RP2040 and desktop machines.
@@ -23,8 +24,7 @@
  * Reference lifetime: references and pointers returned by the containers
  * point into a resident page. They stay valid until other pages are loaded
  * and evict it; at least (VM_RESIDENT_PAGES - 1) other pages can be touched
- * safely. Use a reference right away; do not keep it while doing many other
- * accesses.
+ * safely. Use a reference right away, or hold a VMPin while you keep it.
  *
  * Not thread-safe.
  */
@@ -225,6 +225,7 @@ enum class VMError : uint8_t {
     StorageIO,   ///< Reading or writing the swap file failed.
     OutOfRange,  ///< Index out of range (at(), front(), pop_back() on empty, ...).
     NullPointer, ///< A null VMPtr was dereferenced.
+    TooManyPins, ///< A VMPin would leave fewer than 3 resident pages unpinned.
 };
 
 /// Human-readable name of an error code.
@@ -238,6 +239,7 @@ inline const char* vm_error_name(VMError error) {
         case VMError::StorageIO:   return "StorageIO";
         case VMError::OutOfRange:  return "OutOfRange";
         case VMError::NullPointer: return "NullPointer";
+        case VMError::TooManyPins: return "TooManyPins";
     }
     return "Unknown";
 }
@@ -312,6 +314,7 @@ private:
 
 // Forward declarations for friend declarations
 template<typename T> class VMPtr;
+template<typename T> class VMPin;
 template<typename T> class VMVector;
 template<typename T, size_t N> class VMArray;
 class VMString;
@@ -360,8 +363,14 @@ public:
     bool flush_all() {
         if (!_started) return false;
         bool ok = true;
-        for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f)
-            if (_frames[f].page != vm_detail::kNoPage) ok = save_frame(f) && ok;
+        for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
+            if (_frames[f].page == vm_detail::kNoPage) continue;
+            const bool handed_out = _frames[f].written != vm_detail::Access::Read;
+            ok = save_frame(f) && ok;
+            // References (and pins) obtained before the flush may still be
+            // written through, so the page must be checked again on eviction.
+            if (handed_out) _frames[f].written = vm_detail::Access::MayWrite;
+        }
         return _storage->flush() && ok;
     }
 
@@ -393,6 +402,7 @@ public:
 
 private:
     template<typename T> friend class ::VMPtr;
+    template<typename T> friend class ::VMPin;
     template<typename T> friend class ::VMVector;
     template<typename T, size_t N> friend class ::VMArray;
     friend class ::VMString;
@@ -414,6 +424,7 @@ private:
     struct Frame {
         uint16_t          page;     ///< Virtual page stored here, or kNoPage.
         vm_detail::Access written;  ///< Strongest access since the page was loaded or saved.
+        uint8_t           pins;     ///< Live VMPins; a pinned page is never evicted.
         uint32_t          last_use; ///< Access tick, for least-recently-used eviction.
     };
 
@@ -449,6 +460,7 @@ private:
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
             _frames[f].page = vm_detail::kNoPage;
             _frames[f].written = vm_detail::Access::Read;
+            _frames[f].pins = 0;
             _frames[f].last_use = 0;
         }
         _tick = 0;
@@ -495,6 +507,7 @@ private:
         if (f != vm_detail::kNoFrame) {
             _frames[f].page = vm_detail::kNoPage;
             _frames[f].written = vm_detail::Access::Read;
+            _frames[f].pins = 0;
         }
         _pages[page].flags = 0;
         _pages[page].frame = vm_detail::kNoFrame;
@@ -567,12 +580,18 @@ private:
         attach(page, f);
     }
 
-    /// Return a free resident slot, evicting the least recently used page if necessary.
+    /**
+     * @brief Return a free resident slot, evicting the least recently used
+     *        unpinned page if necessary.
+     *
+     * pin() keeps at least 3 slots unpinned, so a victim always exists.
+     */
     uint8_t acquire_frame() {
-        uint8_t victim = 0;
+        uint8_t victim = vm_detail::kNoFrame;
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
             if (_frames[f].page == vm_detail::kNoPage) return f;
-            if (_frames[f].last_use < _frames[victim].last_use) victim = f;
+            if (_frames[f].pins > 0) continue;
+            if (victim == vm_detail::kNoFrame || _frames[f].last_use < _frames[victim].last_use) victim = f;
         }
 
         save_frame(victim);
@@ -629,6 +648,48 @@ private:
             _storage_size += n;
         }
         return true;
+    }
+
+    // -------------------- Pins --------------------
+
+    enum : uint8_t { kMinUnpinned = 3 }; ///< Containers hold up to 3 pages at once.
+
+    /// Resident slot whose RAM contains `address`, or kNoFrame.
+    uint8_t frame_of(const void* address) const {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(&_frame_data[0][0]);
+        if (a < base || a >= base + uintptr_t(VM_RESIDENT_PAGES) * VM_PAGE_SIZE) return vm_detail::kNoFrame;
+        return uint8_t((a - base) / VM_PAGE_SIZE);
+    }
+
+    uint8_t pinned_frames() const {
+        uint8_t count = 0;
+        for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f)
+            if (_frames[f].pins > 0) count++;
+        return count;
+    }
+
+    /**
+     * @brief Pin the resident page that contains `address`.
+     * @return The pinned slot, or kNoFrame if the address is not in a resident
+     *         page or pinning would leave fewer than kMinUnpinned slots free.
+     */
+    uint8_t pin(const void* address) {
+        const uint8_t f = frame_of(address);
+        if (f == vm_detail::kNoFrame || _frames[f].page == vm_detail::kNoPage) return vm_detail::kNoFrame;
+        const int unpinned_after = VM_RESIDENT_PAGES - pinned_frames() - (_frames[f].pins == 0 ? 1 : 0);
+        if (unpinned_after < kMinUnpinned || _frames[f].pins == 0xFF) {
+            fail(VMError::TooManyPins);
+            return vm_detail::kNoFrame;
+        }
+        _frames[f].pins++;
+        return f;
+    }
+
+    /// Undo pin(). Ignored if the page was freed in the meantime.
+    void unpin(uint8_t f, uint16_t page) {
+        if (f >= VM_RESIDENT_PAGES || _frames[f].page != page || _frames[f].pins == 0) return;
+        _frames[f].pins--;
     }
 
     // -------------------- Small-block heap --------------------
@@ -816,6 +877,80 @@ VMPtr<T> make_vm(Args&&... args) {
     new (mgr.block_ptr(page, offset, vm_detail::Access::Write)) T(vm_detail::forward<Args>(args)...);
     return VMPtr<T>(page, offset);
 }
+
+// -----------------------------------------------------------------------------
+// VMPin
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Keeps the page that holds an object in RAM, so a reference to the
+ *        object stays valid for as long as the pin lives.
+ *
+ * @code
+ * VMPin<long> first(v[0]);   // or: auto first = vm_pin(v[0]);
+ * for (size_t i = 0; i < v.size(); ++i) total += v[i];
+ * *first = 5;                // still the same element
+ * @endcode
+ *
+ * The containers need at least 3 unpinned resident pages, so at most
+ * VM_RESIDENT_PAGES - 3 different pages can be pinned at once (pins on the
+ * same page count once). Beyond that the pin fails with VMError::TooManyPins
+ * and valid() returns false.
+ *
+ * A pin keeps a page, not an element: do not modify the container's layout
+ * (push_back, insert, erase, ...) or destroy it while the pin is alive.
+ */
+template<typename T>
+class VMPin {
+public:
+    /// Pin the page holding `object`, a reference just obtained from a container.
+    explicit VMPin(T& object) : VMPin(&object) {}
+
+    /// Pin the page holding `*object`, e.g. VMPin<const char> text(s.c_str()).
+    explicit VMPin(T* object)
+        : _object(object), _frame(VMManager::instance().pin(object)), _page(page_of(_frame)) {}
+
+    VMPin(VMPin&& other) noexcept : _object(other._object), _frame(other._frame), _page(other._page) {
+        other._frame = vm_detail::kNoFrame;
+    }
+
+    VMPin(const VMPin&) = delete;
+    VMPin& operator=(const VMPin&) = delete;
+    VMPin& operator=(VMPin&&) = delete;
+
+    ~VMPin() { release(); }
+
+    /// True while the page is pinned.
+    bool valid() const { return _frame != vm_detail::kNoFrame; }
+    explicit operator bool() const { return valid(); }
+
+    T& operator*() const { return *_object; }
+    T* operator->() const { return _object; }
+    T* get() const { return _object; }
+
+    /// Unpin before the pin goes out of scope.
+    void release() {
+        if (valid()) VMManager::instance().unpin(_frame, _page);
+        _frame = vm_detail::kNoFrame;
+    }
+
+private:
+    static uint16_t page_of(uint8_t frame) {
+        return frame == vm_detail::kNoFrame ? uint16_t(vm_detail::kNoPage) : VMManager::instance()._frames[frame].page;
+    }
+
+    T*       _object;
+    uint8_t  _frame;
+    uint16_t _page;
+};
+
+/// Pin the page holding `object`: auto pinned = vm_pin(v[0]);
+template<typename T>
+VMPin<T> vm_pin(T& object) { return VMPin<T>(object); }
+
+/// Pin the page holding `*object`: auto text = vm_pin(s.c_str());
+template<typename T>
+VMPin<T> vm_pin(T* object) { return VMPin<T>(object); }
 
 // -----------------------------------------------------------------------------
 // Iterators

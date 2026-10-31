@@ -8,6 +8,7 @@ MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an S
 - `VMArray<T, N>`: fixed-size array
 - `VMString`: mutable string
 - `VMPtr<T>` + `make_vm<T>(...)`: one object in virtual memory
+- `VMPin<T>`: keeps an object's page in RAM while you hold a reference to it
 
 ## Supported boards
 
@@ -123,6 +124,16 @@ first = 5;                                         // wrong: `first` may be stal
 v[0] = 5;                                          // right
 ```
 
+**Pin what you keep.** To keep a reference for longer, hold a `VMPin`. While it lives, the page of the object stays in RAM and the reference stays valid:
+
+```cpp
+VMPin<long> first(v[0]);                           // or: auto first = vm_pin(v[0]);
+for (size_t i = 0; i < v.size(); ++i) total += v[i];
+*first = 5;                                        // right: the page was kept in RAM
+```
+
+The containers need 3 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 3` different pages can be pinned at once; pins on the same page count once. On AVR the default is 3 resident pages, so set `VM_RESIDENT_PAGES` to 4 to pin one page (128 more bytes of RAM). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
+
 **Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
 
 **Not thread-safe.** Use it from one task only, or protect it with a mutex.
@@ -145,6 +156,7 @@ enum class VMError : uint8_t {
     StorageIO,    // reading or writing the swap file failed
     OutOfRange,   // index out of range: at(), front()/back()/pop_back() on empty, ...
     NullPointer,  // a null VMPtr was dereferenced
+    TooManyPins,  // a VMPin would leave fewer than 3 resident pages unpinned
 };
 
 typedef void (*VMErrorHandler)(VMError error);
@@ -229,6 +241,33 @@ public:
 // Like std::make_unique. Returns a null VMPtr if allocation fails.
 template<class T, class... Args>
 VMPtr<T> make_vm(Args&&... args);
+```
+
+### VMPin
+
+```cpp
+// Keeps the page holding an object in RAM while the pin lives (see "Rules to follow").
+// Movable, not copyable.
+template<class T>
+class VMPin {
+public:
+    explicit VMPin(T& object);    // pass a reference just obtained from a container: VMPin<long> p(v[0]);
+    explicit VMPin(T* object);    // e.g. VMPin<const char> text(s.c_str());
+    VMPin(VMPin&& other) noexcept;
+    ~VMPin();                     // unpins
+
+    bool valid() const;           // false if not pinned (TooManyPins, or not in virtual memory)
+    explicit operator bool() const;
+
+    T& operator*() const;
+    T* operator->() const;
+    T* get() const;
+
+    void release();               // unpin early
+};
+
+template<class T> VMPin<T> vm_pin(T& object);   // auto p = vm_pin(v[0]);
+template<class T> VMPin<T> vm_pin(T* object);   // auto text = vm_pin(s.c_str());
 ```
 
 ### VMVector

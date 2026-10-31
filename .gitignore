@@ -1,1 +1,3 @@
-tests/test_containers
+tests/test_default
+tests/test_small
+tests/*.dSYM

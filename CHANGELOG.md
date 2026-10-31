@@ -5,7 +5,7 @@
 First release as an Arduino / PlatformIO library. The core was rewritten, so code written for the earlier `containers.h` needs small changes (see "Upgrading" in the README).
 
 ### Added
-- Runs on any Arduino core with a C++11 compiler: AVR, ESP32, ESP8266, STM32, SAMD, Renesas, RP2040. It uses no exceptions, no RTTI, and no STL; the STL is used when available, so iterators work with `<algorithm>`.
+- Runs on any Arduino core with a C++11 compiler: AVR, ESP32, ESP8266, STM32, SAMD, Renesas, RP2040. It uses no exceptions, no RTTI, no `malloc`, and no STL; the STL is used when available, so iterators work with `<algorithm>`. All of its RAM is static.
 - Real swapping: a fixed pool of `VM_RESIDENT_PAGES` pages in RAM, with least-recently-used eviction, over `VM_PAGE_COUNT` virtual pages.
 - `VMStorage` interface for swap storage, and `VMFileStorage<File>` for any Arduino `File` (SD, SdFat, SDFS, ...).
 - `VMPin<T>` and `vm_pin()` to keep a page in RAM while a reference to it is held.
@@ -23,6 +23,8 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - An empty `VMString` uses no memory.
 - Pages are written back only if they changed; pages read through non-const references are compared with their stored copy first.
 - Storage is flushed only by `flush_all()`.
+- `VMVector` no longer allocates a page table with `malloc`: its pages are linked through the page table that `VMManager` already has, and the last page looked up is remembered, so sequential access stays fast. Without SD, a sketch using `VMVector` is about 700 bytes smaller on AVR. `VMError::OutOfMemory` was removed.
+- `VMStorage` has a protected, non-virtual destructor, so that no `operator delete` (and with it `malloc`) is linked.
 
 ### Fixed
 - `reserve()` before `push_back()` shifted elements by one page.
@@ -36,3 +38,5 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - Writes made after `flush_all()` through earlier references could be lost.
 - Changing a container stored inside virtual memory (`people[i].name.append(...)`, `rows[i].reserve(n)`) could crash or corrupt data when the operation loaded other pages. Each operation now keeps the pages of the container and of its arguments in RAM.
 - `v.assign(4, 1)` chose the iterator-range overload and did not compile.
+- Using an inner container through a reference (`const auto& row = rows[i]; ... row[j]`) could read its fields after its page had been evicted.
+- Copying one inner container to another (`rows[3] = rows[1]`) could fill the copy with zeros when too few pages were free, without reporting an error. Copies now reserve space first, and every step that needs two pages at once checks that they are available.

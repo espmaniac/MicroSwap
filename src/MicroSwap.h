@@ -89,6 +89,11 @@
 #define VM_HEAP_ALIGN VM_DEFAULT_HEAP_ALIGN
 #endif
 
+#ifndef VM_TICK_LIMIT
+/// Testing only: value at which the LRU access counter is renumbered.
+#define VM_TICK_LIMIT 0xFFFFFFFFUL
+#endif
+
 // Use the STL when it is available (not on AVR) so that iterators work with <algorithm>.
 #ifndef VM_USE_STL
 #  if defined(__has_include)
@@ -183,6 +188,13 @@ T& placeholder() {
     return *reinterpret_cast<T*>(storage);
 }
 
+/// How a caller is going to use a page.
+enum class Access : uint8_t {
+    Read,     ///< Only reads.
+    MayWrite, ///< Hands a reference to user code, which may or may not write through it.
+    Write,    ///< Writes.
+};
+
 /// Header in front of every block of a heap page.
 struct BlockHeader {
     uint16_t size;    ///< Payload size in bytes (multiple of VM_HEAP_ALIGN).
@@ -257,6 +269,8 @@ public:
     virtual ~VMStorage() {}
     virtual bool read(uint32_t offset, uint8_t* buf, size_t len) = 0;
     virtual bool write(uint32_t offset, const uint8_t* buf, size_t len) = 0;
+    /// Called by VMManager::flush_all() after writing pages.
+    virtual bool flush() { return true; }
 };
 
 /**
@@ -284,9 +298,12 @@ public:
 
     bool write(uint32_t offset, const uint8_t* buf, size_t len) override {
         if (!_file.seek(offset)) return false;
-        bool ok = static_cast<size_t>(_file.write(buf, len)) == len;
+        return static_cast<size_t>(_file.write(buf, len)) == len;
+    }
+
+    bool flush() override {
         _file.flush();
-        return ok;
+        return true;
     }
 
 private:
@@ -337,15 +354,15 @@ public:
     }
 
     /**
-     * @brief Write every modified resident page to the swap storage.
+     * @brief Write every modified resident page to the swap storage and flush it.
      * @return True if every write succeeded.
      */
     bool flush_all() {
+        if (!_started) return false;
         bool ok = true;
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f)
-            if (_frames[f].page != vm_detail::kNoPage && _frames[f].dirty)
-                ok = write_frame(f) && ok;
-        return ok;
+            if (_frames[f].page != vm_detail::kNoPage) ok = save_frame(f) && ok;
+        return _storage->flush() && ok;
     }
 
     /// Last error since begin() or clear_error().
@@ -395,9 +412,9 @@ private:
 
     /// A resident page slot in RAM.
     struct Frame {
-        uint16_t page;     ///< Virtual page stored here, or kNoPage.
-        bool     dirty;    ///< Modified since loaded.
-        uint32_t last_use; ///< Access tick, for least-recently-used eviction.
+        uint16_t          page;     ///< Virtual page stored here, or kNoPage.
+        vm_detail::Access written;  ///< Strongest access since the page was loaded or saved.
+        uint32_t          last_use; ///< Access tick, for least-recently-used eviction.
     };
 
     VMStorage*     _storage = nullptr;
@@ -431,7 +448,7 @@ private:
         }
         for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
             _frames[f].page = vm_detail::kNoPage;
-            _frames[f].dirty = false;
+            _frames[f].written = vm_detail::Access::Read;
             _frames[f].last_use = 0;
         }
         _tick = 0;
@@ -462,7 +479,7 @@ private:
             uint8_t f = acquire_frame();
             memset(_frame_data[f], 0, VM_PAGE_SIZE);
             attach(p, f);
-            _frames[f].dirty = true; // the swap file holds stale data for this page
+            _frames[f].written = vm_detail::Access::Write; // the swap file holds stale data for this page
             _pages[p].flags = PAGE_ALLOCATED;
             _pages[p].heap_largest = 0;
             return p;
@@ -477,7 +494,7 @@ private:
         uint8_t f = _pages[page].frame;
         if (f != vm_detail::kNoFrame) {
             _frames[f].page = vm_detail::kNoPage;
-            _frames[f].dirty = false;
+            _frames[f].written = vm_detail::Access::Read;
         }
         _pages[page].flags = 0;
         _pages[page].frame = vm_detail::kNoFrame;
@@ -487,30 +504,57 @@ private:
     /**
      * @brief Pointer to the RAM copy of a page, loading it if needed.
      * @param page Allocated page index.
-     * @param write True if the caller may modify the page.
+     * @param access How the caller is going to use the page.
      * @return Pointer to VM_PAGE_SIZE bytes, or nullptr if the page is not allocated.
      */
-    uint8_t* page_ptr(uint16_t page, bool write) {
+    uint8_t* page_ptr(uint16_t page, vm_detail::Access access) {
         if (!is_allocated(page)) return nullptr;
         if (_pages[page].frame == vm_detail::kNoFrame) load_page(page);
 
         Frame& frame = _frames[_pages[page].frame];
-        frame.last_use = ++_tick;
-        if (write) frame.dirty = true;
+        frame.last_use = next_tick();
+        if (access > frame.written) frame.written = access;
         return _frame_data[_pages[page].frame];
     }
 
     /// Pointer to a byte offset inside a page (see page_ptr()).
-    void* block_ptr(uint16_t page, uint16_t offset, bool write) {
-        uint8_t* data = page_ptr(page, write);
+    void* block_ptr(uint16_t page, uint16_t offset, vm_detail::Access access) {
+        uint8_t* data = page_ptr(page, access);
         return data ? data + offset : nullptr;
     }
 
     void attach(uint16_t page, uint8_t f) {
         _frames[f].page = page;
-        _frames[f].dirty = false;
-        _frames[f].last_use = ++_tick;
+        _frames[f].written = vm_detail::Access::Read;
+        _frames[f].last_use = next_tick();
         _pages[page].frame = f;
+    }
+
+    /**
+     * @brief Next access tick for LRU ordering.
+     *
+     * When the counter is about to overflow, resident pages are renumbered
+     * 1..VM_RESIDENT_PAGES in their current order. Without this, pages used
+     * right after the overflow would look the oldest and be evicted first,
+     * invalidating references that should still be valid.
+     */
+    uint32_t next_tick() {
+        if (_tick >= VM_TICK_LIMIT) renumber_frames();
+        return ++_tick;
+    }
+
+    void renumber_frames() {
+        uint8_t rank[VM_RESIDENT_PAGES];
+        for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) {
+            rank[f] = 0;
+            for (uint8_t g = 0; g < VM_RESIDENT_PAGES; ++g) {
+                const bool older = _frames[g].last_use < _frames[f].last_use ||
+                                   (_frames[g].last_use == _frames[f].last_use && g < f);
+                if (older) rank[f]++;
+            }
+        }
+        for (uint8_t f = 0; f < VM_RESIDENT_PAGES; ++f) _frames[f].last_use = rank[f] + 1;
+        _tick = VM_RESIDENT_PAGES;
     }
 
     void load_page(uint16_t page) {
@@ -531,21 +575,47 @@ private:
             if (_frames[f].last_use < _frames[victim].last_use) victim = f;
         }
 
-        if (_frames[victim].dirty) write_frame(victim);
+        save_frame(victim);
         _pages[_frames[victim].page].frame = vm_detail::kNoFrame;
         _frames[victim].page = vm_detail::kNoPage;
-        _frames[victim].dirty = false;
+        _frames[victim].written = vm_detail::Access::Read;
         return victim;
     }
 
-    bool write_frame(uint8_t f) {
+    /**
+     * @brief Write a resident page to storage if it changed.
+     *
+     * A page handed out only as references (Access::MayWrite) is compared
+     * with its stored copy first, so pages that were only read through
+     * non-const references are not written again.
+     */
+    bool save_frame(uint8_t f) {
+        const vm_detail::Access written = _frames[f].written;
+        if (written == vm_detail::Access::Read) return true;
+        if (written == vm_detail::Access::MayWrite && same_as_storage(f)) {
+            _frames[f].written = vm_detail::Access::Read;
+            return true;
+        }
+
         const uint32_t offset = storage_offset(_frames[f].page);
         bool ok = extend_storage(offset) && _storage->write(offset, _frame_data[f], VM_PAGE_SIZE);
         if (!ok) { fail(VMError::StorageIO); return false; }
 
-        _frames[f].dirty = false;
+        _frames[f].written = vm_detail::Access::Read;
         _storage_size = vm_detail::max_of<uint32_t>(_storage_size, offset + VM_PAGE_SIZE);
         _swap_outs++;
+        return true;
+    }
+
+    /// True if the resident copy of a page equals the copy in storage.
+    bool same_as_storage(uint8_t f) {
+        uint8_t chunk[32];
+        const uint32_t offset = storage_offset(_frames[f].page);
+        for (size_t pos = 0; pos < VM_PAGE_SIZE; pos += sizeof(chunk)) {
+            const size_t n = vm_detail::min_of(sizeof(chunk), size_t(VM_PAGE_SIZE - pos));
+            if (!_storage->read(offset + pos, chunk, n)) return false;
+            if (memcmp(chunk, _frame_data[f] + pos, n) != 0) return false;
+        }
         return true;
     }
 
@@ -594,7 +664,7 @@ private:
         if (p == vm_detail::kNoPage) return false;
         _pages[p].flags |= PAGE_HEAP;
 
-        vm_detail::BlockHeader* first = block_at(page_ptr(p, true), 0);
+        vm_detail::BlockHeader* first = block_at(page_ptr(p, vm_detail::Access::Write), 0);
         first->size = vm_detail::kHeapMaxPayload;
         first->is_free = 1;
 
@@ -605,7 +675,7 @@ private:
 
     /// First-fit allocation inside one heap page.
     bool alloc_in_heap_page(uint16_t page, size_t need, uint16_t& out_offset, size_t& out_usable) {
-        uint8_t* data = page_ptr(page, true);
+        uint8_t* data = page_ptr(page, vm_detail::Access::Write);
         const size_t header = vm_detail::kBlockHeaderSize;
 
         for (size_t off = 0; off < VM_PAGE_SIZE; off += header + block_at(data, off)->size) {
@@ -633,7 +703,7 @@ private:
     void heap_free(uint16_t page, uint16_t payload_offset) {
         if (!is_allocated(page) || !(_pages[page].flags & PAGE_HEAP)) return;
 
-        uint8_t* data = page_ptr(page, true);
+        uint8_t* data = page_ptr(page, vm_detail::Access::Write);
         block_at(data, payload_offset - vm_detail::kBlockHeaderSize)->is_free = 1;
 
         const uint16_t largest = merge_free_blocks(data);
@@ -690,13 +760,13 @@ public:
     const T* operator->() const { return get(); }
 
     /// Pointer to the object in RAM; valid until its page is evicted.
-    T* get() { return pointer(true); }
-    const T* get() const { return pointer(false); }
+    T* get() { return pointer(vm_detail::Access::MayWrite); }
+    const T* get() const { return pointer(vm_detail::Access::Read); }
 
     /// Destroy the object and free its storage. The pointer becomes null.
     void destroy() {
         if (!valid()) return;
-        vm_detail::destroy(get());
+        vm_detail::destroy(pointer(vm_detail::Access::Write));
         VMManager::instance().heap_free(_page, _offset);
         _page = vm_detail::kNoPage;
         _offset = 0;
@@ -710,12 +780,12 @@ private:
 
     VMPtr(uint16_t page, uint16_t offset) : _page(page), _offset(offset) {}
 
-    T* pointer(bool write) const {
+    T* pointer(vm_detail::Access access) const {
         if (!valid()) {
             VMManager::instance().fail(VMError::NullPointer);
             return &vm_detail::placeholder<T>();
         }
-        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, write));
+        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, access));
     }
 
     uint16_t _page;
@@ -743,7 +813,7 @@ VMPtr<T> make_vm(Args&&... args) {
     size_t usable = 0;
     if (!mgr.heap_alloc(sizeof(T), page, offset, usable)) return VMPtr<T>();
 
-    new (mgr.block_ptr(page, offset, true)) T(vm_detail::forward<Args>(args)...);
+    new (mgr.block_ptr(page, offset, vm_detail::Access::Write)) T(vm_detail::forward<Args>(args)...);
     return VMPtr<T>(page, offset);
 }
 
@@ -913,8 +983,8 @@ public:
 
     // -------------------- Element access --------------------
 
-    reference operator[](size_type i) { return *element(i, true); }
-    const_reference operator[](size_type i) const { return *element(i, false); }
+    reference operator[](size_type i) { return *element(i, vm_detail::Access::MayWrite); }
+    const_reference operator[](size_type i) const { return *element(i, vm_detail::Access::Read); }
 
     reference at(size_type i) { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
     const_reference at(size_type i) const { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
@@ -925,8 +995,8 @@ public:
     const_reference back() const { return at(_size - 1); }
 
     /// Contiguous storage; nullptr in paged mode or when nothing is allocated.
-    T* data() { return has_flat_block() ? flat_element(0, true) : nullptr; }
-    const T* data() const { return has_flat_block() ? flat_element(0, false) : nullptr; }
+    T* data() { return has_flat_block() ? flat_element(0, vm_detail::Access::MayWrite) : nullptr; }
+    const T* data() const { return has_flat_block() ? flat_element(0, vm_detail::Access::Read) : nullptr; }
 
     // -------------------- Capacity --------------------
 
@@ -975,7 +1045,7 @@ public:
 
         // Bubble the new element down to its position.
         for (size_type i = _size - 1; i > idx; --i)
-            vm_detail::swap((*this)[i], (*this)[i - 1]);
+            vm_detail::swap(*element(i, vm_detail::Access::Write), *element(i - 1, vm_detail::Access::Write));
         return iterator(this, idx);
     }
 
@@ -986,7 +1056,7 @@ public:
         const size_type idx = pos.pos();
         if (idx >= _size) return end();
         for (size_type i = idx; i + 1 < _size; ++i)
-            (*this)[i] = vm_detail::move((*this)[i + 1]);
+            *element(i, vm_detail::Access::Write) = vm_detail::move(*element(i + 1, vm_detail::Access::Write));
         pop_back();
         return iterator(this, idx);
     }
@@ -994,7 +1064,7 @@ public:
     void pop_back() {
         if (_size == 0) { VMManager::instance().fail(VMError::OutOfRange); return; }
         _size--;
-        if (!vm_detail::is_trivially_destructible<T>::value) element(_size, true)->~T();
+        if (!vm_detail::is_trivially_destructible<T>::value) element(_size, vm_detail::Access::Write)->~T();
 
         // Return a page as soon as the last one becomes empty.
         if (!_flat_mode && _chunk_count > chunks_for(_size)) release_last_chunk();
@@ -1003,7 +1073,7 @@ public:
     /// Destroy all elements and free all storage.
     void clear() {
         if (!vm_detail::is_trivially_destructible<T>::value)
-            for (size_type i = 0; i < _size; ++i) element(i, true)->~T();
+            for (size_type i = 0; i < _size; ++i) element(i, vm_detail::Access::Write)->~T();
         _size = 0;
 
         if (has_flat_block()) VMManager::instance().heap_free(_flat_page, _flat_offset);
@@ -1111,26 +1181,26 @@ private:
 
     static size_type chunks_for(size_type n) { return (n + kPerPage - 1) / kPerPage; }
 
-    T* element(size_type i, bool write) const {
-        return _flat_mode ? flat_element(i, write) : paged_element(i, write);
+    T* element(size_type i, vm_detail::Access access) const {
+        return _flat_mode ? flat_element(i, access) : paged_element(i, access);
     }
 
-    T* flat_element(size_type i, bool write) const {
-        return static_cast<T*>(VMManager::instance().block_ptr(_flat_page, _flat_offset, write)) + i;
+    T* flat_element(size_type i, vm_detail::Access access) const {
+        return static_cast<T*>(VMManager::instance().block_ptr(_flat_page, _flat_offset, access)) + i;
     }
 
-    T* paged_element(size_type i, bool write) const {
-        uint8_t* page = VMManager::instance().page_ptr(_chunks[i / kPerPage], write);
+    T* paged_element(size_type i, vm_detail::Access access) const {
+        uint8_t* page = VMManager::instance().page_ptr(_chunks[i / kPerPage], access);
         return reinterpret_cast<T*>(page) + i % kPerPage;
     }
 
     /// Make room for one more element; returns where it goes, or nullptr.
     T* back_slot() {
-        if (_flat_mode && _size < _flat_capacity) return flat_element(_size, true);
-        if (_flat_mode && grow_flat_block(_size + 1)) return flat_element(_size, true);
+        if (_flat_mode && _size < _flat_capacity) return flat_element(_size, vm_detail::Access::Write);
+        if (_flat_mode && grow_flat_block(_size + 1)) return flat_element(_size, vm_detail::Access::Write);
         if (_flat_mode && !transition_to_paged()) return nullptr;
         if (!ensure_chunks(_size + 1)) return nullptr;
-        return paged_element(_size, true);
+        return paged_element(_size, vm_detail::Access::Write);
     }
 
     /**
@@ -1151,8 +1221,8 @@ private:
         if (!mgr.heap_alloc(new_cap * sizeof(T), page, offset, usable)) return false;
 
         for (size_type i = 0; i < _size; ++i) {
-            T* src = flat_element(i, true);
-            T* dst = static_cast<T*>(mgr.block_ptr(page, offset, true)) + i;
+            T* src = flat_element(i, vm_detail::Access::Write);
+            T* dst = static_cast<T*>(mgr.block_ptr(page, offset, vm_detail::Access::Write)) + i;
             new (dst) T(vm_detail::move(*src));
             vm_detail::destroy(src);
         }
@@ -1170,8 +1240,8 @@ private:
         if (!ensure_chunks(_size)) return false;
 
         for (size_type i = 0; i < _size; ++i) {
-            T* src = flat_element(i, true);
-            new (paged_element(i, true)) T(vm_detail::move(*src));
+            T* src = flat_element(i, vm_detail::Access::Write);
+            new (paged_element(i, vm_detail::Access::Write)) T(vm_detail::move(*src));
             vm_detail::destroy(src);
         }
 
@@ -1250,7 +1320,7 @@ public:
 
     VMArray& operator=(const VMArray& other) {
         if (this != &other)
-            for (size_type i = 0; i < N; ++i) (*this)[i] = other[i];
+            for (size_type i = 0; i < N; ++i) *element(i, vm_detail::Access::Write) = other[i];
         return *this;
     }
 
@@ -1266,8 +1336,8 @@ public:
 
     ~VMArray() { release(); }
 
-    reference operator[](size_type i) { return *element(i, true); }
-    const_reference operator[](size_type i) const { return *element(i, false); }
+    reference operator[](size_type i) { return *element(i, vm_detail::Access::MayWrite); }
+    const_reference operator[](size_type i) const { return *element(i, vm_detail::Access::Read); }
 
     reference at(size_type i) { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
     const_reference at(size_type i) const { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
@@ -1281,7 +1351,7 @@ public:
     constexpr bool empty() const { return N == 0; }
 
     void fill(const T& value) {
-        for (size_type i = 0; i < N; ++i) (*this)[i] = value;
+        for (size_type i = 0; i < N; ++i) *element(i, vm_detail::Access::Write) = value;
     }
 
     /// Assign T() to every element.
@@ -1315,7 +1385,7 @@ private:
     }
 
     T* raw_element(size_type i) const {
-        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, true)) + i;
+        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, vm_detail::Access::Write)) + i;
     }
 
     void release() {
@@ -1332,12 +1402,12 @@ private:
         return false;
     }
 
-    T* element(size_type i, bool write) const {
+    T* element(size_type i, vm_detail::Access access) const {
         if (!allocated()) {
             if (!allocate()) return &vm_detail::placeholder<T>();
             for (size_type k = 0; k < N; ++k) new (raw_element(k)) T();
         }
-        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, write)) + i;
+        return static_cast<T*>(VMManager::instance().block_ptr(_page, _offset, access)) + i;
     }
 };
 
@@ -1422,8 +1492,8 @@ public:
 
     // -------------------- Element access --------------------
 
-    reference operator[](size_type i) { return in_range(i) ? buffer(true)[i] : vm_detail::placeholder<char>(); }
-    const_reference operator[](size_type i) const { return in_range(i) ? buffer(false)[i] : vm_detail::placeholder<char>(); }
+    reference operator[](size_type i) { return in_range(i) ? buffer(vm_detail::Access::MayWrite)[i] : vm_detail::placeholder<char>(); }
+    const_reference operator[](size_type i) const { return in_range(i) ? buffer(vm_detail::Access::Read)[i] : vm_detail::placeholder<char>(); }
     reference at(size_type i) { return (*this)[i]; }
     const_reference at(size_type i) const { return (*this)[i]; }
     reference front() { return (*this)[0]; }
@@ -1432,7 +1502,7 @@ public:
     const_reference back() const { return (*this)[_size - 1]; }
 
     /// Null-terminated contents; valid until the page is evicted.
-    const char* c_str() const { return has_block() ? buffer(false) : ""; }
+    const char* c_str() const { return has_block() ? buffer(vm_detail::Access::Read) : ""; }
 
     // -------------------- Capacity --------------------
 
@@ -1600,8 +1670,8 @@ private:
 
     bool has_block() const { return _page != vm_detail::kNoPage; }
 
-    char* buffer(bool write) const {
-        return static_cast<char*>(VMManager::instance().block_ptr(_page, _offset, write));
+    char* buffer(vm_detail::Access access) const {
+        return static_cast<char*>(VMManager::instance().block_ptr(_page, _offset, access));
     }
 
     bool in_range(size_type i) const {
@@ -1612,7 +1682,7 @@ private:
 
     bool points_into_buffer(const char* s) const {
         if (!has_block()) return false;
-        const char* b = buffer(false);
+        const char* b = buffer(vm_detail::Access::Read);
         return s >= b && s <= b + _capacity;
     }
 
@@ -1643,8 +1713,8 @@ private:
         size_t usable = 0;
         if (!mgr.heap_alloc(new_cap + 1, page, offset, usable)) return false;
 
-        char* dst = static_cast<char*>(mgr.block_ptr(page, offset, true));
-        if (has_block()) memcpy(dst, buffer(false), _size + 1);
+        char* dst = static_cast<char*>(mgr.block_ptr(page, offset, vm_detail::Access::Write));
+        if (has_block()) memcpy(dst, buffer(vm_detail::Access::Read), _size + 1);
         else dst[0] = '\0';
 
         if (has_block()) mgr.heap_free(_page, _offset);
@@ -1666,7 +1736,7 @@ private:
         if (new_size == 0 && !has_block()) return nullptr; // stays empty
         if (!ensure_capacity(new_size, _capacity + _capacity / 2)) return nullptr;
 
-        char* b = buffer(true);
+        char* b = buffer(vm_detail::Access::Write);
         // Shift the tail, including the terminator.
         memmove(b + pos + gap_len, b + pos + count, _size - pos - count + 1);
         _size = new_size;

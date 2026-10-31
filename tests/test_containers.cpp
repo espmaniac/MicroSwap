@@ -29,6 +29,8 @@ static int g_failures = 0;
 class RamStorage : public VMStorage {
 public:
     bool fail_writes = false;
+    int writes = 0;
+    int flushes = 0;
 
     bool read(uint32_t offset, uint8_t* buf, size_t len) override {
         if (offset + len > _data.size()) return false;
@@ -42,6 +44,12 @@ public:
         if (offset > _data.size()) return false;
         if (offset + len > _data.size()) _data.resize(offset + len);
         memcpy(&_data[offset], buf, len);
+        writes++;
+        return true;
+    }
+
+    bool flush() override {
+        flushes++;
         return true;
     }
 
@@ -328,6 +336,60 @@ static void test_storage_write_failure_reports_error() {
     g_storage->fail_writes = false;
 }
 
+static void test_reading_does_not_write_pages() {
+    const size_t n = INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3);
+    VMVector<int> v;
+    for (size_t i = 0; i < n; ++i) v.push_back(int(i));
+    vm().flush_all();
+
+    // Non-const access hands out references, but nothing is modified.
+    const uint32_t outs = vm().swap_out_count();
+    long long sum = 0;
+    for (int round = 0; round < 3; ++round)
+        for (size_t i = 0; i < n; ++i) sum += v[i];
+    CHECK(sum == 3LL * (long long)n * (n - 1) / 2);
+    CHECK(vm().swap_out_count() == outs);
+    CHECK(vm().swap_in_count() > 0);
+}
+
+static void test_writes_through_references_are_saved() {
+    const size_t n = INTS_PER_PAGE * (VM_RESIDENT_PAGES * 3);
+    VMVector<int> v;
+    for (size_t i = 0; i < n; ++i) v.push_back(int(i));
+    for (size_t i = 0; i < n; ++i) v[i] += 1;
+
+    size_t wrong = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (v[i] != int(i) + 1) wrong++;
+    CHECK(wrong == 0);
+}
+
+static void test_references_survive_counter_overflow() {
+    // In the small configuration VM_TICK_LIMIT is low, so the access
+    // counter is renumbered many times during this loop.
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * 8; ++i) v.push_back(int(i));
+
+    size_t stale = 0;
+    for (size_t k = 0; k < 5000; ++k) {
+        const size_t a = (k % 8) * INTS_PER_PAGE;
+        const size_t b = ((k * 3 + 1) % 8) * INTS_PER_PAGE;
+        int& ref = v[a];
+        (void)v[b]; // one other page: the reference must stay valid
+        if (ref != int(a) || &ref != &v[a]) stale++;
+    }
+    CHECK(stale == 0);
+}
+
+static void test_storage_flushed_only_by_flush_all() {
+    VMVector<int> v;
+    for (size_t i = 0; i < INTS_PER_PAGE * (VM_RESIDENT_PAGES * 2); ++i) v.push_back(int(i));
+    CHECK(g_storage->writes > 0);
+    CHECK(g_storage->flushes == 0);
+    CHECK(vm().flush_all());
+    CHECK(g_storage->flushes == 1);
+}
+
 #if VM_USE_STL
 static void test_stl_algorithms() {
     // Enough elements to span more pages than fit in RAM.
@@ -399,6 +461,10 @@ int main() {
         {"VMArray", test_vmarray},
         {"VMPtr", test_vmptr},
         {"storage write failure reports error", test_storage_write_failure_reports_error},
+        {"reading does not write pages", test_reading_does_not_write_pages},
+        {"writes through references are saved", test_writes_through_references_are_saved},
+        {"references survive counter overflow", test_references_survive_counter_overflow},
+        {"storage flushed only by flush_all", test_storage_flushed_only_by_flush_all},
 #if VM_USE_STL
         {"STL algorithms", test_stl_algorithms},
         {"sort objects with strings", test_sort_objects_with_strings},

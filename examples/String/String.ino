@@ -80,9 +80,27 @@ void setup() {
     Serial.println(a.compare(b));
 
     // ---- Capacity ----
-    // A string is stored in one page, so its length is limited.
-    Serial.print(F("max_size(): "));
-    Serial.println(VMString::max_size());
+    // Up to max_flat_size() characters a string is one block, with c_str().
+    Serial.print(F("max_flat_size(): "));
+    Serial.println(VMString::max_flat_size());
+
+    // ---- A long string ----
+    // Longer, it is stored in pages like a vector: it can be longer than the
+    // RAM, and everything but c_str() works on it.
+    VMString log;
+    for (int i = 0; i < 40; ++i) {
+        log += "line ";
+        log += char('0' + i % 10);
+        log += '\n';
+    }
+    Serial.print(F("Long string: "));
+    Serial.print(log.size());
+    Serial.print(F(" characters, in one block: "));
+    Serial.println(log.is_flat() ? F("yes") : F("no"));
+    Serial.print(F("find(\"line 7\") "));
+    Serial.println((long)log.find("line 7"));
+    Serial.print(F("Last line: "));
+    for (size_t i = log.size() - 7; i < log.size(); ++i) Serial.write(log[i]);
 
     VMString empty;
     Serial.print(F("Empty string is empty(): "));

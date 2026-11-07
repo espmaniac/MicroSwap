@@ -55,16 +55,19 @@ struct VMSpiChip {
 
 /// Descriptions of common chips, from their datasheets.
 namespace VMSpiChips {
-// Microchip SPI SRAM.
-constexpr VMSpiChip LC1024(131072UL, 3, 20000000UL, kVMSpiModeRegister); ///< 23LC1024 / 23A1024, 128 KB
-constexpr VMSpiChip LC512(65536UL, 2, 20000000UL, kVMSpiModeRegister);   ///< 23LC512 / 23A512, 64 KB
-constexpr VMSpiChip K256(32768UL, 2, 20000000UL, kVMSpiModeRegister);    ///< 23K256, 32 KB
-constexpr VMSpiChip K640(8192UL, 2, 20000000UL, kVMSpiModeRegister);     ///< 23K640, 8 KB
-// SPI PSRAM, 3.3 V: chip select at most 8 us low, 1 KB pages.
-constexpr VMSpiChip APS6404(8388608UL, 3, 33000000UL, kVMSpiReset, 8, 1024); ///< APS6404L, ESP-PSRAM64H, LY68L6400, 8 MB
-// FRAM: does not wear out and keeps its data without power.
-constexpr VMSpiChip MB85RS64V(8192UL, 2, 20000000UL, kVMSpiWriteEnable);  ///< Fujitsu MB85RS64V, 8 KB
-constexpr VMSpiChip FM25V10(131072UL, 3, 40000000UL, kVMSpiWriteEnable);  ///< Infineon FM25V10, 128 KB
+// Microchip SPI SRAM: sequential mode set in the mode register, 20 MHz.
+constexpr VMSpiChip LC1024(131072UL, 3, 20000000UL, kVMSpiModeRegister); ///< 23LC1024 / 23A1024, 128 KB, 2.5-5.5 V
+constexpr VMSpiChip LC512(65536UL, 2, 20000000UL, kVMSpiModeRegister);   ///< 23LC512 / 23A512, 64 KB, 2.5-5.5 V
+constexpr VMSpiChip K256(32768UL, 2, 20000000UL, kVMSpiModeRegister);    ///< 23K256, 32 KB, 2.7-3.6 V
+constexpr VMSpiChip K640(8192UL, 2, 20000000UL, kVMSpiModeRegister);     ///< 23K640, 8 KB, 2.7-3.6 V
+// SPI PSRAM, 2.7-3.6 V: read 0x03 up to 33 MHz, reset at start, 1 KB pages
+// that wrap, and chip select low at most 8 us (3 us for the extended
+// temperature grade), or the chip misses its refresh and loses data.
+constexpr VMSpiChip APS6404(8388608UL, 3, 33000000UL, kVMSpiReset, 8, 1024);  ///< APS6404L, ESP-PSRAM64H, LY68L6400, 8 MB
+constexpr VMSpiChip APS6404X(8388608UL, 3, 33000000UL, kVMSpiReset, 3, 1024); ///< APS6404L ...X, -40 to 105 C
+// FRAM: does not wear out and keeps its data without power; write enable before every write.
+constexpr VMSpiChip MB85RS64V(8192UL, 2, 20000000UL, kVMSpiWriteEnable);  ///< Fujitsu MB85RS64V, 8 KB, 3.0-5.5 V
+constexpr VMSpiChip FM25V10(131072UL, 3, 40000000UL, kVMSpiWriteEnable);  ///< Infineon FM25V10, 128 KB, 2.0-3.6 V
 } // namespace VMSpiChips
 
 class VMSpiMemoryStorage : public VMStorage {
@@ -96,6 +99,8 @@ public:
         _spi.begin();
 
         if (_chip.flags & kVMSpiReset) {
+            // PSRAM finishes its power-up 150 us after the supply is stable.
+            delayMicroseconds(150);
             command(kResetEnable);
             command(kReset);
             delayMicroseconds(100);

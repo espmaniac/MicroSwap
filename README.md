@@ -1,35 +1,193 @@
 # MicroSwap
 
-Virtual memory with a swap file, and STL-like containers on top of it, for Arduino boards with little RAM.
+**More memory than your board has.** MicroSwap gives Arduino boards vectors, strings, maps and ring buffers that are much bigger than their RAM. It keeps a few pages of data in RAM and the rest on an SD card, in an SPI memory chip or in flash, and moves pages back and forth by itself as you use the data.
 
-MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an SD card or flash. Pages are loaded back automatically when you access them, and the least recently used page is written out to make room. An Arduino Uno can hold a `VMVector<long>` of thousands of elements while using about 0.7 KB of RAM.
+```cpp
+VMVector<long> readings;                 // 4 KB of data on an Uno, which has 2 KB of RAM
+for (long i = 0; i < 1000; ++i) readings.push_back(i * i);
+Serial.println(readings[999]);           // 998001 — the page is loaded back by itself
+```
 
-- `VMVector<T>`: vector, works with `std::sort` and other algorithms where the STL exists
-- `VMMap<Key, T>`: map sorted by key, like `std::map`
-- `VMRingBuffer<T>`: ring buffer of the last N elements (sensor readings, logs), or a queue
-- `VMArray<T, N>`: fixed-size array
-- `VMString`: mutable string, of any length (a long one is stored in pages, like a vector)
-- `VMPtr<T>` + `make_vm<T>(...)`: one object in virtual memory
-- `VMPin<T>`: keeps an object's page in RAM while you hold a reference to it
+MicroSwap itself takes about 0.7 KB of RAM on an Uno; raise `VM_PAGE_COUNT` for more virtual memory (see [Configuration](#configuration)).
 
-## Supported boards
+- Works like the standard containers: `push_back`, `insert`, `find`, `for (auto x : v)`, `std::sort`.
+- Any Arduino board with a C++11 compiler: AVR (Uno, Mega), ESP32, ESP8266, RP2040, STM32, SAMD, Teensy and more.
+- No `malloc`, no exceptions: all of its RAM is reserved at compile time, so the IDE shows it.
+- Costs nothing until you use it: including the header adds no byte of flash or RAM.
 
-Any Arduino core with a C++11 compiler. The library uses no exceptions, no RTTI and no `malloc` (all of its RAM is static, so the IDE reports it at compile time), and needs no STL or `FS.h`. Every push is compiled in CI for:
+## Quick start
 
-| Board | Core | `<algorithm>` support |
+1. Install the library (see [Installation](#installation)) and wire an SD card module to the SPI pins.
+2. Open the swap file, start MicroSwap, use the containers:
+
+```cpp
+#include <SPI.h>
+#include <SD.h>
+#include <MicroSwap.h>
+
+File swapFile;
+VMFileStorage<File> swapStorage(swapFile);   // MicroSwap's pages go to this file
+
+void setup() {
+    Serial.begin(115200);
+    SD.begin(SS);                            // your card's chip select pin
+
+    SD.remove("/swap.bin");                  // start with an empty swap file
+    swapFile = SD.open("/swap.bin", O_READ | O_WRITE | O_CREAT);   // ESP32: SD.open("/swap.bin", "w+")
+    VMManager::instance().begin(swapStorage);
+
+    VMVector<long> v;
+    for (long i = 0; i < 1000; ++i) v.push_back(i * i);
+    Serial.println(v[999]);                  // 998001
+}
+
+void loop() {}
+```
+
+The examples use a ready `SwapFile.h` (in each example's folder) that opens the file the right way on every board: copy it into your sketch and call `beginSwapOrHalt()`.
+
+## Which container do I need?
+
+| You want | Use | Like |
 |---|---|---|
-| Arduino Uno, Mega | AVR | no (the core has no STL) |
-| Arduino Nano Every | megaAVR | no |
-| Arduino Due | SAM | no |
-| Arduino Nano 33 BLE | Mbed (nRF52840) | yes |
-| Arduino Nano RP2040 Connect | Mbed (RP2040) | yes |
-| Teensy 4.1 | Teensyduino | yes |
-| Arduino MKR Zero | SAMD | yes |
-| Arduino Uno R4 Minima | Renesas | yes |
-| ESP32, ESP32-C3, ESP32-S3 | esp32 | yes |
-| NodeMCU (ESP8266) | esp8266 | yes |
-| Blue Pill (STM32F103) | STM32duino | yes |
-| Raspberry Pi Pico | arduino-pico | yes |
+| A list that grows: readings, records, a buffer | `VMVector<T>` | `std::vector` |
+| Text, of any length: messages, logs, JSON | `VMString` | `std::string` |
+| The last N values (newest replaces oldest), or a queue | `VMRingBuffer<T>` | a circular buffer |
+| Look up by key: settings, names, counts | `VMMap<Key, T>` | `std::map` |
+| A fixed number of elements, e.g. a global table | `VMArray<T, N>` | `std::array` |
+| One big object (a struct, a buffer) | `VMPtr<T>` with `make_vm<T>(...)` | a pointer (copies share the object) |
+
+Mostly you can take code written for the standard containers and change the type: `std::vector<long>` becomes `VMVector<long>`. Read [the three rules](#the-three-rules) first.
+
+## Where do the pages go?
+
+MicroSwap needs one storage for its pages. Pick one:
+
+| Storage | Good | Watch out |
+|---|---|---|
+| **SD card**, a file (`VMFileStorage<File>`) | gigabytes; any SD library (SD, SdFat, SDFS) | the SD library takes flash and RAM; slower |
+| **SPI memory chip**: SRAM, PSRAM, FRAM (`VMSpiMemoryStorage`) | fast, does not wear out, small code (no file system) | one chip, 8 KB to 8 MB |
+| **Internal flash**, LittleFS / SPIFFS (`VMFileStorage<File>`) | nothing to wire | wears out under constant rewrites: for tests, or with many pages in RAM |
+| **Anything else** (`VMCustomStorage`, two functions) | your own memory or protocol | you write the read and write |
+
+On an Uno the SPI memory chip is the lightest choice: the SpiMemory example takes 9.2 KB of flash and 1 KB of RAM, the Basic example with an SD card 20 KB and 1.8 KB.
+
+### An SD card or a flash file
+
+The file must be opened for reading **and** writing, and stay open:
+
+| Library | Open with |
+|---|---|
+| ESP32 `SD`, `LittleFS` | `SD.open(path, "w+")` |
+| ESP8266 / RP2040 `SDFS` | `SDFS.open(path, "w+")` |
+| Arduino `SD` (AVR, SAMD, STM32, ...) | `SD.open(path, O_READ \| O_WRITE \| O_CREAT)` |
+| SdFat | `sd.open(path, O_RDWR \| O_CREAT \| O_TRUNC)` |
+
+Do not use `FILE_WRITE` with the Arduino `SD` library: it appends every write to the end of the file.
+
+Tips for SD card modules:
+- On an ESP32 the first `SD.begin()` after a reset can fail: the reset does not cut the card's power, and the card may still be busy. Call it again; the examples try three times.
+- Many modules (HW-125 and alike) have their own 3.3 V regulator and need **5 V** on VCC.
+- Many do not release MISO when the card is not selected: give such a module an SPI bus of its own.
+- With long wires, keep the SPI clock at 10 MHz or less.
+
+### An SPI memory chip
+
+Include `MicroSwapSpiMemory.h` and pick your chip:
+
+```cpp
+#include <MicroSwapSpiMemory.h>
+
+VMSpiMemoryStorage memory(10, VMSpiChips::LC1024);   // chip select pin, chip
+
+void setup() {
+    if (!memory.begin()) {
+        // no chip answers, it is smaller than described, or the virtual memory does not fit
+    }
+    VMManager::instance().begin(memory);
+}
+```
+
+| `VMSpiChips::` | Chip | Size | Supply |
+|---|---|---|---|
+| `LC1024` | Microchip 23LC1024 / 23A1024 SRAM | 128 KB | 2.5–5.5 V |
+| `LC512` | Microchip 23LC512 / 23A512 SRAM | 64 KB | 2.5–5.5 V |
+| `K256`, `K640` | Microchip 23K256, 23K640 SRAM | 32 KB, 8 KB | 2.7–3.6 V |
+| `APS6404` | APS6404L / ESP-PSRAM64H / LY68L6400 PSRAM | 8 MB | 2.7–3.6 V |
+| `APS6404X` | the same, extended temperature grade (to 105 °C) | 8 MB | 2.7–3.6 V |
+| `MB85RS64V` | Fujitsu MB85RS64V FRAM | 8 KB | 3.0–5.5 V |
+| `FM25V10` | Infineon FM25V10 FRAM | 128 KB | 2.0–3.6 V |
+
+The descriptions follow the datasheets; on real chips they are not tested yet (see [Tested on hardware](#tested-on-hardware)). The virtual memory (`VM_PAGE_SIZE * VM_PAGE_COUNT`) must fit in the chip. `begin()` checks the chip; the SPI clock defaults to 8 MHz, never above the chip's (pass another as the third argument), and other devices can share the SPI bus.
+
+**A chip that is not in the list.** Chips differ only in a few numbers, so describe yours — no code needed:
+
+```cpp
+// capacity, address bytes (2, 3 or 4), max clock, flags,
+// then optionally: max chip-select time (µs), page bytes, read command, write command, dummy bytes after a read's address
+const VMSpiChip myChip(65536UL, 2, 20000000UL, kVMSpiWriteEnable);
+VMSpiMemoryStorage memory(10, myChip);
+```
+
+Flags: `kVMSpiModeRegister` sets sequential mode at start (Microchip SRAM); `kVMSpiWriteEnable` sends write enable before every write (FRAM, MRAM); `kVMSpiReset` resets the chip at start (PSRAM). PSRAM also needs its chip-select time and its page size: transfers are split to respect both, so a faster SPI clock makes it faster. Flash and EEPROM chips are not for swapping: they need erasing or slow page writes, and they wear out.
+
+### Storage of your own
+
+For any other memory, give MicroSwap two functions:
+
+```cpp
+bool myRead(void* context, uint32_t offset, uint8_t* buf, size_t len)        { /* ... */ return true; }
+bool myWrite(void* context, uint32_t offset, const uint8_t* buf, size_t len) { /* ... */ return true; }
+
+VMCustomStorage storage(myRead, myWrite);   // optional: a context passed to both, a flush function
+VMManager::instance().begin(storage);
+```
+
+Each returns `false` if the transfer failed. Or implement the `VMStorage` interface (see [Swap storage](#swap-storage)).
+
+## The three rules
+
+**1. Use a reference right away.** `v[i]`, `*it`, `*ptr` and `s.c_str()` point into a page in RAM. When other pages are loaded later, that page may leave RAM and the reference then points to other data:
+
+```cpp
+long& first = v[0];
+for (size_t i = 0; i < v.size(); ++i) total += v[i];   // may move v[0]'s page out
+first = 5;                                             // wrong: `first` may be stale
+
+v[0] = 5;                                              // right
+```
+
+To keep a reference longer, pin its page with `VMPin`:
+
+```cpp
+VMPin<long> first(v[0]);                               // or: auto first = vm_pin(v[0]);
+for (size_t i = 0; i < v.size(); ++i) total += v[i];
+*first = 5;                                            // right: the page stayed in RAM
+```
+
+At most `VM_RESIDENT_PAGES - 4` pages can be pinned at once (the containers need 4 for their own work): one by default, four on ESP32, none on AVR unless you raise `VM_RESIDENT_PAGES` to 5. A pin that does not fit reports `TooManyPins` and `valid()` is false. Do not `push_back`, `insert`, `erase` or destroy a container while a pin into it lives.
+
+**2. Store only types whose bytes can move.** Pages go to storage and come back byte by byte, often to another place in RAM, so a stored object moves without its copy constructor. Numbers, structs, pointers to other memory and MicroSwap's own containers are fine. A type that points into itself breaks: `std::string` of the GCC library (ESP32, RP2040, STM32, Linux) does, and so do `std::function` and many classes with a small built-in buffer — on an ESP32 a `VMVector<std::string>` gave wrong strings and crashed. Arduino `String` and `std::vector` do move fine, but keep their contents in the normal heap, so they save no RAM. Use `VMString` and `VMVector`.
+
+**3. With several tasks, use one lock for the whole library.** All containers share the same pages and tables, so two tasks working on two different vectors still touch the same data. Hold the lock from getting a reference until you are done with it:
+
+```cpp
+SemaphoreHandle_t vmLock = xSemaphoreCreateMutex();   // one for all containers
+
+void worker(void*) {
+    for (;;) {
+        xSemaphoreTake(vmLock, portMAX_DELAY);
+        long& x = values[0];                           // valid only while the lock is held
+        x += 1;
+        xSemaphoreGive(vmLock);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+The library does not lock by itself: a lock per call would slow every access without making references safe.
+
+Also good to know: **data does not survive a reset** — `begin()` starts with empty memory.
 
 ## Installation
 
@@ -47,12 +205,6 @@ lib_deps =
     arduino-libraries/SD    ; for the examples; not needed on ESP32 / ESP8266 / RP2040
 ```
 
-To change the configuration, use build flags so that every file sees the same values:
-
-```ini
-build_flags = -DVM_RESIDENT_PAGES=4
-```
-
 **Arduino CLI.** `arduino-cli lib install --git-url https://github.com/espmaniac/MicroSwap.git` (needs `library.enable_unsafe_install` set to `true`).
 
 ## Examples
@@ -61,145 +213,42 @@ build_flags = -DVM_RESIDENT_PAGES=4
 |---|---|
 | [Basic](examples/Basic/Basic.ino) | A vector bigger than RAM, a string, swap statistics |
 | [Vector](examples/Vector/Vector.ino) | Every `VMVector` operation: insert, erase, iterators, flat and paged storage, resize, copy, swap, compare |
+| [String](examples/String/String.ino) | Building, searching, extracting, editing and comparing `VMString`, and a long string |
+| [RingBuffer](examples/RingBuffer/RingBuffer.ino) | The last 2000 sensor readings in a `VMRingBuffer`: average, minimum, maximum, and use as a queue |
+| [Map](examples/Map/Map.ino) | Counting words with a `VMMap<VMString, int>`, and a table by number: insert, update, erase, lookups by C string |
 | [Array](examples/Array/Array.ino) | `VMArray` as a global, arrays of structs, fill, copy, iterators |
-| [String](examples/String/String.ino) | Building, searching, extracting, editing and comparing `VMString` |
 | [Pointer](examples/Pointer/Pointer.ino) | `make_vm`, `VMPtr` as a long-lived object used from `loop()`, `destroy()` |
 | [Pin](examples/Pin/Pin.ino) | Keeping references and C strings valid with `VMPin`, and the pin limit |
 | [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
 | [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
-| [Map](examples/Map/Map.ino) | Counting words with a `VMMap<VMString, int>`, and a table by number: insert, update, erase, lookups by C string |
-| [RingBuffer](examples/RingBuffer/RingBuffer.ino) | The last 2000 sensor readings in a `VMRingBuffer`: average, minimum, maximum, and use as a queue |
-| [SpiMemory](examples/SpiMemory/SpiMemory.ino) | Swapping to an SPI memory chip (23LC1024 SRAM, PSRAM, FRAM) with `VMSpiMemoryStorage` |
+| [SpiMemory](examples/SpiMemory/SpiMemory.ino) | Swapping to an SPI memory chip (23LC1024 SRAM, PSRAM, FRAM) |
 | [CustomStorage](examples/CustomStorage/CustomStorage.ino) | A storage of your own on two functions, with `VMCustomStorage` |
 
 All examples except SpiMemory and CustomStorage put the swap file on an SD card, through `SwapFile.h` in the example's folder. Set `SD_CS_PIN` there to your card's chip select pin.
 
-## Quick start
-
-```cpp
-#include <SPI.h>
-#include <SD.h>
-#include <MicroSwap.h>
-
-File swapFile;
-VMFileStorage<File> swapStorage(swapFile);
-
-void setup() {
-    Serial.begin(115200);
-    SD.begin(SS);
-
-    // The swap file must be open for reading and writing (see below).
-    SD.remove("/swap.bin");
-    swapFile = SD.open("/swap.bin", O_READ | O_WRITE | O_CREAT);
-    VMManager::instance().begin(swapStorage);
-
-    VMVector<long> v;
-    for (long i = 0; i < 1000; ++i) v.push_back(i * i);
-    Serial.println(v[999]); // 998001
-}
-
-void loop() {}
-```
-
-`SwapFile.h` in [`examples/Basic`](examples/Basic) opens the swap file the right way on each board; see [Examples](#examples) for the rest.
-
-### Opening the swap file
-
-The file must be opened for both reading and writing and must stay open:
-
-| Library | Open with |
-|---|---|
-| ESP32 `SD` | `SD.open(path, "w+")` |
-| ESP8266 / RP2040 `SDFS` | `SDFS.open(path, "w+")` |
-| Arduino `SD` (AVR, SAMD, STM32, ...) | `SD.open(path, O_READ \| O_WRITE \| O_CREAT)` |
-| SdFat | `sd.open(path, O_RDWR \| O_CREAT \| O_TRUNC)` |
-
-Do not use `FILE_WRITE` with the Arduino `SD` library: it appends every write to the end of the file.
-
-On an ESP32 the first `SD.begin()` after a reset can fail: the reset does not cut the card's power, and the card may still be in the middle of a command. Calling it again works, so the examples try up to three times. Many SD modules (HW-125 and alike) need 5 V on VCC, as they have their own 3.3 V regulator, and do not release MISO when the card is not selected: give such a module an SPI bus of its own. With long wires, keep the SPI clock at 10 MHz or less.
-
-Prefer an SD card over the board's internal flash (`LittleFS`, `SPIFFS`). Swapping rewrites the same pages over and over, and internal flash wears out after a limited number of writes. If you must use it, raise `VM_RESIDENT_PAGES` to swap less.
-
-### SPI memory chips instead of a file
-
-An SPI memory chip is a good place for swapped pages: it needs no file system and no SD library, it is faster than a card, and SRAM, PSRAM, FRAM and MRAM do not wear out. `MicroSwapSpiMemory.h` has a storage for them; pick your chip from `VMSpiChips`:
-
-```cpp
-#include <MicroSwapSpiMemory.h>
-
-VMSpiMemoryStorage memory(10, VMSpiChips::LC1024);   // chip select pin, chip; then SPI clock (8 MHz), SPIClass
-
-void setup() {
-    if (!memory.begin()) { /* no chip, smaller than described, or the virtual memory does not fit */ }
-    VMManager::instance().begin(memory);
-}
-```
-
-| `VMSpiChips::` | Chip | Size |
-|---|---|---|
-| `LC1024` | Microchip 23LC1024 / 23A1024 SRAM | 128 KB |
-| `LC512` | Microchip 23LC512 / 23A512 SRAM | 64 KB |
-| `K256`, `K640` | Microchip 23K256, 23K640 SRAM | 32 KB, 8 KB |
-| `APS6404` | APS6404L / ESP-PSRAM64H / LY68L6400 PSRAM (3.3 V) | 8 MB |
-| `MB85RS64V` | Fujitsu MB85RS64V FRAM | 8 KB |
-| `FM25V10` | Infineon FM25V10 FRAM | 128 KB |
-
-The descriptions come from the datasheets; so far the storage is tested against simulated chips only (see "Tested on hardware").
-
-**A chip that is not in the list.** Describe it: chips differ only in a few numbers, so no code is needed for one that reads and writes by address like these:
-
-```cpp
-// capacity, address bytes, max clock, flags, max chip-select time (us), page bytes,
-// read command, write command, dummy bytes after a read's address
-const VMSpiChip myChip(65536UL, 2, 20000000UL, kVMSpiWriteEnable);
-VMSpiMemoryStorage memory(10, myChip);
-```
-
-Flags: `kVMSpiModeRegister` (set sequential mode at start, Microchip SRAM), `kVMSpiWriteEnable` (write enable before every write, FRAM and MRAM), `kVMSpiReset` (reset at start, PSRAM). PSRAM also needs its chip-select time (8 µs) and page size (1 KB): transfers are split to respect both, so a faster SPI clock makes it faster.
-
-`begin()` checks that the description is valid, that the chip answers, that it really holds the described capacity (a smaller chip mirrors its first half) and that the virtual memory (`VM_PAGE_SIZE * VM_PAGE_COUNT`) fits. The chip shares the SPI bus with other devices: each transfer takes the bus with its own settings and chip select. Flash and EEPROM chips are not for swapping: they need erasing or slow page writes, and they wear out.
-
-### Storage of your own
-
-For any other memory, give MicroSwap two functions with `VMCustomStorage`:
-
-```cpp
-bool chipRead(void* context, uint32_t offset, uint8_t* buf, size_t len)        { /* ... */ return true; }
-bool chipWrite(void* context, uint32_t offset, const uint8_t* buf, size_t len) { /* ... */ return true; }
-
-VMCustomStorage storage(chipRead, chipWrite);   // optional: context passed to both, flush function
-```
-
-or implement `VMStorage`:
-
-```cpp
-class MyStorage : public VMStorage {
-public:
-    bool read(uint32_t offset, uint8_t* buf, size_t len) override { /* ... */ }
-    bool write(uint32_t offset, const uint8_t* buf, size_t len) override { /* ... */ }
-};
-```
-
 ## Configuration
 
-Define these as build flags, or with `#define` before `#include <MicroSwap.h>` in every file that includes it:
+Set these as build flags (`build_flags = -DVM_RESIDENT_PAGES=6` in PlatformIO), or with `#define` before `#include <MicroSwap.h>` in every file that includes it:
 
 | Macro | Meaning | AVR | ESP32 | Others |
 |---|---|---|---|---|
-| `VM_PAGE_SIZE` | Bytes per page; also the largest string, array or object | 128 | 4096 | 1024 |
+| `VM_PAGE_SIZE` | Bytes per page; also the largest array or object | 128 | 4096 | 1024 |
 | `VM_RESIDENT_PAGES` | Pages kept in RAM (4 to 254) | 4 | 8 | 5 |
 | `VM_PAGE_COUNT` | Total virtual pages | 48 | 256 | 128 |
 | `VM_HEAP_ALIGN` | Alignment of stored objects | 2 | 8 | 8 |
 | `VM_TICK_BITS` | Width of the least-recently-used counter (16 or 32) | 16 | 32 | 32 |
 | `VM_YIELD()` | Called after every page transferred to or from storage | — | — | `yield()` on ESP8266, nothing elsewhere |
 
-RAM used is about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes. The swap file grows up to `VM_PAGE_SIZE * VM_PAGE_COUNT` bytes. More resident pages mean fewer swaps; smaller pages mean less data written per swap.
+How much memory that is:
+- **RAM:** about `VM_PAGE_SIZE * VM_RESIDENT_PAGES + 4 * VM_PAGE_COUNT` bytes — 0.7 KB on AVR, 33 KB on ESP32 — reserved as soon as you use MicroSwap, however many containers you have.
+- **Virtual memory:** `VM_PAGE_SIZE * VM_PAGE_COUNT` — 6 KB on AVR, 1 MB on ESP32; the swap file grows up to that.
+- **More resident pages** mean fewer swaps; **smaller pages** mean less data moved per swap.
 
-A page is written back only if it changed. Pages read through non-const references (`v[i]` on a non-const vector, iterators passed to algorithms) are compared with their stored copy before eviction and are not rewritten when nothing changed.
+A page is written back only if it changed, so reading does not wear the storage.
 
 ## Errors
 
-Errors (out of pages, storage failure, index out of range, ...) are passed to an error handler. The default handler calls `abort()`. Set your own to log and reset, or to return:
+Errors — out of pages, a storage failure, an index out of range — go to an error handler. The default one calls `abort()`. Set your own to log and reset, or to carry on:
 
 ```cpp
 void onVMError(VMError error) {
@@ -210,42 +259,11 @@ void onVMError(VMError error) {
 VMManager::instance().set_error_handler(onVMError);
 ```
 
-If the handler returns, the failed operation does nothing; for example, `push_back` does not add the element. Element access then returns a placeholder object with meaningless contents. `VMManager::instance().last_error()` returns the last error. Two errors are not recoverable this way: after `StorageIO` the affected page's contents are lost, and after `TooManyPins` caused by deeply nested containers data may be corrupted, so stop or reset the board for those.
+If the handler returns, the failed operation does nothing (`push_back` does not add the element), element access returns a placeholder with meaningless contents, and `VMManager::instance().last_error()` tells what happened. Two errors cannot be recovered this way: after `StorageIO` the affected page is lost, and after `TooManyPins` from deeply nested containers data may be corrupted, so stop or reset the board for those.
 
-## Rules to follow
+## More about the containers
 
-**Use references right away.** `v[i]`, `*ptr`, `s.c_str()` and iterators' `*it` return references into a page in RAM. If other pages are loaded afterwards, that page may be swapped out and the reference then points to other data. At least `VM_RESIDENT_PAGES - 1` other pages can be touched safely. That is enough for the containers' own operations. `std::sort` over vectors of numbers and of objects with `VMString` members is covered by the tests, but other algorithms, or comparators that touch many objects at once, can exceed the limit; raise `VM_RESIDENT_PAGES` if in doubt. Do not keep a reference while doing a lot of other work:
-
-```cpp
-long& first = v[0];
-for (size_t i = 0; i < v.size(); ++i) total += v[i]; // may evict v[0]'s page
-first = 5;                                         // wrong: `first` may be stale
-
-v[0] = 5;                                          // right
-```
-
-**Pin what you keep.** To keep a reference for longer, hold a `VMPin`. While it lives, the page of the object stays in RAM and the reference stays valid:
-
-```cpp
-VMPin<long> first(v[0]);                           // or: auto first = vm_pin(v[0]);
-for (size_t i = 0; i < v.size(); ++i) total += v[i];
-*first = 5;                                        // right: the page was kept in RAM
-```
-
-The containers need 4 unpinned pages for their own work, so at most `VM_RESIDENT_PAGES - 4` different pages can be pinned at once; pins on the same page count once. That is one pin by default, four on ESP32, and none on AVR: there, set `VM_RESIDENT_PAGES` to 5 to pin one page (or 5 pages of 64 bytes, as the `Pin` example does, to keep the RAM use). A pin that does not fit reports `VMError::TooManyPins` and `valid()` returns false. A pin keeps a page, not an element: do not `push_back`, `insert`, `erase` or destroy the container while a pin into it is alive.
-
-**Containers inside containers.** A container can be stored inside virtual memory, such as a `VMString` member of a vector element or a vector of vectors. Each operation keeps in RAM the page of the container itself and of the objects passed to it, and every element access marks the container's page as used, so a reference to an inner container stays valid while you keep using it:
-
-```cpp
-const VMVector<long>& row = rows[2];
-for (size_t i = 0; i < row.size(); ++i) total += row[i]; // fine
-```
-
-An operation needs up to 4 resident pages at once. Deeper nesting, or an operation between two inner containers on different pages (copying or comparing `rows[1]` and `rows[3]`), can need one or two more. If there are not enough, the operation reports `VMError::TooManyPins` and, where it can, stops before changing anything; the default handler stops the program there. A handler that returns may see data corrupted in the cases the library cannot stop.
-
-**Limits.** A `VMArray` or `VMPtr` object must fit in one page. `VMVector` elements must fit in one page each; the vector itself can span all pages.
-
-**Long strings.** A `VMString` of up to `VMString::max_flat_size()` characters (one page minus a few bytes: 123 on AVR, 4087 on ESP32) is stored in one block, and `c_str()` returns its characters. A longer one is stored in whole pages, like a large vector, so it can be longer than the RAM: every member works the same (`s[i]`, `+=`, `insert`, `find`, `compare`, iterators, `<algorithm>`), and pages are loaded as its characters are used. Only `c_str()` cannot work, because no single piece of memory holds all the characters: on a long string (`is_flat()` false) it reports `VMError::TooLarge` and returns `""`. Read a long string with `s[i]`, a loop over its characters or `copy()`:
+**Long strings.** A `VMString` of up to `VMString::max_flat_size()` characters (123 on AVR, 4087 on ESP32) is one block, and `c_str()` gives its characters. A longer one is stored in pages like a big vector, so it can be longer than the RAM; everything works the same (`s[i]`, `+=`, `insert`, `find`, `compare`, iterators) except `c_str()`, because no single piece of memory holds all the characters. On a long string (`is_flat()` false) `c_str()` reports `TooLarge` and returns `""`; read it character by character or with `copy()`:
 
 ```cpp
 VMString log;                                  // grows past one page as lines are added
@@ -254,32 +272,22 @@ if (log.find("ERROR") != VMString::npos) { ... }
 for (char c : log) Serial.write(c);            // works for any length
 ```
 
-A long string goes back to one block, with `c_str()`, when it is cleared, or on `shrink_to_fit()` once it fits.
+A long string becomes one block again when cleared, or on `shrink_to_fit()` once it fits.
 
-**Element types.** Pages are written to storage and read back byte by byte, and may come back to another place in RAM, so an object in virtual memory moves without its copy or move constructor being called. Store types whose bytes can be moved: numbers, structs, pointers to other memory, and MicroSwap's own containers. A type that points into itself breaks when its page moves: `std::string` of the GCC library (used on ESP32, RP2040, STM32 and Linux) keeps short strings in itself and points to them, and so do `std::function` and many classes with a small built-in buffer. On an ESP32, a `VMVector<std::string>` gave wrong strings and then crashed in `free()` once its pages had moved. Arduino `String` and `std::vector` can be moved, but their characters and elements stay in the normal heap, so they save no RAM: use `VMString` and `VMVector`.
+**Maps.** `VMMap` keeps its entries sorted in a vector: a lookup is a binary search, and keys inserted in ascending order are simply appended, but inserting in the middle moves the entries after it. It suits tables read more than changed. With `VMString` keys, `find("name")` compares with the C string directly and allocates nothing.
 
-**Several tasks (ESP32, RP2040, FreeRTOS).** The library is not thread-safe, and two things matter when more than one task uses it:
-
-- *Use one lock for the whole library, not one per container.* All containers share the same `VMManager`: its page table, its pages in RAM and its usage counter. Two tasks working on two different vectors still change the same tables at the same time.
-- *Keep the lock while you use references.* `v[i]`, `*it` and `c_str()` point into a page in RAM, and another task can swap that page out. Taking the lock only around each call is not enough: hold it from getting a reference until you are done with it.
+**Containers inside containers.** A `VMString` member of a vector element, a vector of vectors, maps in a vector: all work. Each operation keeps in RAM the container and the objects passed to it, so a reference to an inner container stays valid while you use it:
 
 ```cpp
-SemaphoreHandle_t vmLock = xSemaphoreCreateMutex(); // one for all containers
-
-void worker(void*) {
-    for (;;) {
-        xSemaphoreTake(vmLock, portMAX_DELAY);
-        long& x = values[0];   // valid only while the lock is held
-        x += 1;
-        xSemaphoreGive(vmLock);
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
+const VMVector<long>& row = rows[2];
+for (size_t i = 0; i < row.size(); ++i) total += row[i];   // fine
 ```
 
-The library does not lock by itself: a lock per call would cost every element access time without making references safe.
+An operation needs up to 4 resident pages; deeper nesting, or an operation between two inner containers on different pages (copying `rows[1]` to `rows[3]`), can need one or two more. Without them it reports `TooManyPins` and, where it can, stops before changing anything.
 
-**Data does not survive a reset.** `begin()` starts with empty memory.
+**Limits.** A `VMArray` or `VMPtr` object must fit in one page. Each `VMVector` element must fit in one page; the vector itself can span all pages.
+
+**Algorithms.** The iterators are random-access, so `<algorithm>` works where the board has the STL (every board in [Supported boards](#supported-boards) except AVR, megaAVR and SAM). `std::sort` over numbers and over objects with `VMString` members is covered by the tests; algorithms or comparators that hold many objects at once may need a larger `VM_RESIDENT_PAGES`.
 
 ## Speed
 
@@ -296,8 +304,6 @@ Measured on a simulated 16 MHz ATmega (simavr, cycle-accurate) with the AVR defa
 | `VMString::push_back` | 52 µs |
 | `make_vm` + `destroy` | 102 µs |
 | Swapping one page in and out (without the storage time) | 175 µs |
-
-On 32-bit boards element access is much cheaper, but the storage time dominates as soon as pages swap. So the rule is the same everywhere: work on nearby elements together, and give the library enough resident pages for the data you use at once.
 
 ## API reference
 
@@ -363,7 +369,7 @@ struct VMSpiChip {
                         uint16_t max_select_us = 0, uint16_t page_bytes = 0, uint8_t read_command = 0x03,
                         uint8_t write_command = 0x02, uint8_t read_dummy_bytes = 0);
 };
-namespace VMSpiChips { /* LC1024, LC512, K256, K640, APS6404, MB85RS64V, FM25V10 */ }
+namespace VMSpiChips { /* LC1024, LC512, K256, K640, APS6404, APS6404X, MB85RS64V, FM25V10 */ }
 class VMSpiMemoryStorage : public VMStorage {
 public:
     VMSpiMemoryStorage(uint8_t cs_pin, const VMSpiChip& chip, uint32_t clock_hz = 0, SPIClass& spi = SPI);
@@ -817,14 +823,33 @@ VMString operator+(const VMString& a, const char* b);
 VMString operator+(const char* a, const VMString& b);
 ```
 
+## Supported boards
+
+Any Arduino core with a C++11 compiler. The library uses no exceptions, no RTTI and no `malloc` (all of its RAM is static, so the IDE reports it at compile time), and needs no STL or `FS.h`. Every change is compiled in CI for:
+
+| Board | Core | `<algorithm>` support |
+|---|---|---|
+| Arduino Uno, Mega | AVR | no (the core has no STL) |
+| Arduino Nano Every | megaAVR | no |
+| Arduino Due | SAM | no |
+| Arduino Nano 33 BLE | Mbed (nRF52840) | yes |
+| Arduino Nano RP2040 Connect | Mbed (RP2040) | yes |
+| Teensy 4.1 | Teensyduino | yes |
+| Arduino MKR Zero | SAMD | yes |
+| Arduino Uno R4 Minima | Renesas | yes |
+| ESP32, ESP32-C3, ESP32-S3 | esp32 | yes |
+| NodeMCU (ESP8266) | esp8266 | yes |
+| Blue Pill (STM32F103) | STM32duino | yes |
+| Raspberry Pi Pico | arduino-pico | yes |
+
 ## Tested on hardware
 
 Besides the host tests and the CI builds, the examples were run on real boards:
 
 | Board | Swap storage | Result |
 |---|---|---|
-| ESP32 (ESP32-D0WDQ6, Arduino core 2.x) | SD card, HW-125 module on VSPI | Every example correct with the ESP32 defaults and with 128-byte pages, 4 of them in RAM (constant swapping) |
-| ESP32 | LittleFS on the internal flash | The same |
+| ESP32 (ESP32-D0WDQ6, Arduino core 2.x) | SD card, HW-125 module on VSPI | Every example correct with the ESP32 defaults and with 128-byte pages, 4 of them in RAM (constant swapping), including RingBuffer, Map and a long string; an 8000-character string edited 60 times in the middle with 512 bytes of pages in RAM |
+| ESP32 | LittleFS on the internal flash | Every example correct |
 
 `VMSpiMemoryStorage` is tested against simulated chips of each family (commands, addresses, chip select, write enable, PSRAM pages and chip-select time), not yet on real ones.
 

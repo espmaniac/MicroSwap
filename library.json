@@ -19,7 +19,7 @@
   "platforms": "*",
   "headers": ["MicroSwap.h", "MicroSwapSpiMemory.h"],
   "export": {
-    "exclude": ["tests", ".github"]
+    "exclude": ["tests", ".github", "IDEAS.md"]
   },
   "examples": [
     {

@@ -18,6 +18,7 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - Run on a real ESP32 with an SD card and with LittleFS (README, "Tested on hardware").
 - README: which element types can live in virtual memory (not `std::string` of the GCC library, or anything else that points into itself), and notes on SD modules.
 - The examples try `SD.begin()` up to three times on ESP32: the first one after a reset can fail.
+- `VMSpiSramStorage` (`MicroSwapSpiSram.h`): swap storage on Microchip SPI SRAM chips (23LC1024, 23LC512, 23K256, 23K640), with a check in `begin()` that the chip answers and holds what was declared, and the SpiSram example. Tested against a simulated chip; not yet on a real one.
 - `VMString` of any length up to `max_size()` (all virtual pages): a string longer than `max_flat_size()` is stored in whole pages and loaded as its characters are used, so it can be longer than the RAM. Every member works on it except `c_str()`, which needs one block (`is_flat()`); on a long string it reports `TooLarge` and returns `""`. `shrink_to_fit()` brings a long string that fits back to one block. About 1.7 KB more flash on an Uno, no more RAM.
 
 ### Changed

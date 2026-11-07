@@ -1,6 +1,7 @@
-// Swapping to an SPI SRAM chip (23LC1024 and alike) with the storage that
-// comes with MicroSwap: no SD card and no file system, faster, and SRAM does
-// not wear out.
+// Swapping to an SPI memory chip with the storage that comes with MicroSwap:
+// no SD card and no file system, faster, and SRAM does not wear out. Pick
+// your chip from VMSpiChips (23LC1024 SRAM here; PSRAM and FRAM work the same
+// way), or describe your own (see the README).
 //
 // Wiring: the chip on the board's default SPI pins (SCK, MOSI, MISO), chip
 // select on SRAM_CS_PIN, VCC 2.5-5.5 V (23LC1024; 23K256 takes 2.7-3.6 V).
@@ -13,19 +14,18 @@
 #define VM_PAGE_COUNT 128
 #endif
 
-#include <MicroSwapSpiSram.h>
+#include <MicroSwapSpiMemory.h>
 
 const uint8_t SRAM_CS_PIN = SS; // change to your chip's chip select pin
 
-// For a 23LC512 pass 65536, for a 23K256 32768, as the second argument.
-VMSpiSramStorage sram(SRAM_CS_PIN);
+VMSpiMemoryStorage sram(SRAM_CS_PIN, VMSpiChips::LC1024);
 
 void setup() {
     Serial.begin(115200);
     while (!Serial) delay(10);
 
     if (!sram.begin()) {
-        Serial.println(F("No SRAM chip answers on SRAM_CS_PIN, or it is smaller than declared"));
+        Serial.println(F("No chip answers on SRAM_CS_PIN, or it is smaller than described"));
         while (true) delay(1000);
     }
     VMManager& vm = VMManager::instance();

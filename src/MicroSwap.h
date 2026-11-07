@@ -378,6 +378,43 @@ private:
     FileT& _file;
 };
 
+/**
+ * @brief Swap storage on functions of your own: for any memory MicroSwap has
+ *        no storage for, without writing a class.
+ *
+ *     bool chip_read(void* ctx, uint32_t offset, uint8_t* buf, size_t len) { ... }
+ *     bool chip_write(void* ctx, uint32_t offset, const uint8_t* buf, size_t len) { ... }
+ *     VMCustomStorage storage(chip_read, chip_write);
+ *     VMManager::instance().begin(storage);
+ *
+ * Each function returns false if the transfer failed. `context` is passed to
+ * every call (a chip select pin, a driver object, ...); `flush`, called by
+ * VMManager::flush_all(), may be nullptr.
+ */
+class VMCustomStorage : public VMStorage {
+public:
+    typedef bool (*ReadFunction)(void* context, uint32_t offset, uint8_t* buf, size_t len);
+    typedef bool (*WriteFunction)(void* context, uint32_t offset, const uint8_t* buf, size_t len);
+    typedef bool (*FlushFunction)(void* context);
+
+    VMCustomStorage(ReadFunction read, WriteFunction write, void* context = nullptr, FlushFunction flush = nullptr)
+        : _read(read), _write(write), _flush(flush), _context(context) {}
+
+    bool read(uint32_t offset, uint8_t* buf, size_t len) override { return _read && _read(_context, offset, buf, len); }
+
+    bool write(uint32_t offset, const uint8_t* buf, size_t len) override {
+        return _write && _write(_context, offset, buf, len);
+    }
+
+    bool flush() override { return !_flush || _flush(_context); }
+
+private:
+    ReadFunction  _read;
+    WriteFunction _write;
+    FlushFunction _flush;
+    void*         _context;
+};
+
 // Forward declarations for friend declarations
 class VMManager;
 namespace vm_detail {

@@ -424,6 +424,7 @@ template<typename> struct ManagerStorage;
 template<typename T> class VMPtr;
 template<typename T> class VMPin;
 template<typename T> class VMVector;
+template<typename T> class VMRingBuffer;
 template<typename T, size_t N> class VMArray;
 class VMString;
 
@@ -512,6 +513,7 @@ private:
     template<typename T> friend class ::VMPin;
     friend class vm_detail::KeepResident;
     template<typename T> friend class ::VMVector;
+    template<typename T> friend class ::VMRingBuffer;
     template<typename T, size_t N> friend class ::VMArray;
     friend class ::VMString;
     template<typename T, typename... Args> friend VMPtr<T> make_vm(Args&&... args);
@@ -1832,6 +1834,151 @@ private:
 
         _chunk_count = keep;
         if (_cached_chunk >= keep) _cached_page = vm_detail::kNoPage;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// VMRingBuffer
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Fixed-capacity ring buffer in virtual memory: the last `capacity`
+ *        elements pushed, oldest first.
+ *
+ * push_back() on a full buffer overwrites the oldest element, so the buffer
+ * always holds the newest ones: sensor readings, log lines, events.
+ * try_push_back() instead refuses when full, for a queue that must not lose
+ * anything. Index 0 and front() are the oldest element, back() the newest.
+ *
+ * The elements live in a VMVector, so the buffer can span many pages. Its
+ * memory is taken as elements are pushed, not when it is created, so it can
+ * be a global variable; clear() gives it back. A popped element is reset to
+ * T(), so a VMString element frees its memory.
+ */
+template<typename T>
+class VMRingBuffer {
+public:
+    typedef T value_type;
+    typedef T& reference;
+    typedef const T& const_reference;
+    typedef size_t size_type;
+    typedef ptrdiff_t difference_type;
+
+    using iterator               = vm_detail::IndexIterator<VMRingBuffer, T, false>;
+    using const_iterator         = vm_detail::IndexIterator<VMRingBuffer, T, true>;
+    using reverse_iterator       = vm_detail::ReverseIterator<iterator>;
+    using const_reverse_iterator = vm_detail::ReverseIterator<const_iterator>;
+
+    explicit VMRingBuffer(size_type capacity) : _capacity(capacity) {}
+
+    // -------------------- Element access (0 is the oldest) --------------------
+
+    reference operator[](size_type i) { return _slots[slot(i)]; }
+    const_reference operator[](size_type i) const { return _slots[slot(i)]; }
+    reference at(size_type i) { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
+    const_reference at(size_type i) const { return in_range(i) ? (*this)[i] : vm_detail::placeholder<T>(); }
+    reference front() { return at(0); }
+    const_reference front() const { return at(0); }
+    reference back() { return at(_count - 1); }
+    const_reference back() const { return at(_count - 1); }
+
+    iterator begin() { return iterator(this, 0); }
+    iterator end() { return iterator(this, _count); }
+    const_iterator begin() const { return const_iterator(this, 0); }
+    const_iterator end() const { return const_iterator(this, _count); }
+    const_iterator cbegin() const { return begin(); }
+    const_iterator cend() const { return end(); }
+    reverse_iterator rbegin() { return reverse_iterator(end()); }
+    reverse_iterator rend() { return reverse_iterator(begin()); }
+    const_reverse_iterator rbegin() const { return const_reverse_iterator(end()); }
+    const_reverse_iterator rend() const { return const_reverse_iterator(begin()); }
+
+    // -------------------- Capacity --------------------
+
+    bool empty() const { return _count == 0; }
+    bool full() const { return _count == _capacity; }
+    size_type size() const { return _count; }
+    size_type capacity() const { return _capacity; }
+
+    // -------------------- Modifiers --------------------
+
+    /// Add an element at the back; when full, the oldest is overwritten.
+    void push_back(const T& value) { emplace_back(value); }
+    void push_back(T&& value) { emplace_back(vm_detail::move(value)); }
+
+    template<typename... Args>
+    void emplace_back(Args&&... args) {
+        vm_detail::KeepResident keep(this, &args...);
+        if (_capacity == 0) { VMManager::instance().fail(VMError::OutOfRange); return; }
+        if (full()) {
+            // The oldest slot becomes the newest. The value is made before the
+            // slot is looked up, so the slot's reference is used at once.
+            T value(vm_detail::forward<Args>(args)...);
+            _slots[_head] = vm_detail::move(value);
+            _head = next(_head);
+            return;
+        }
+        const size_type tail = slot(_count);
+        if (tail == _slots.size()) {
+            // First time round: the slot is new. Reserving it all at once
+            // keeps the vector from growing and moving step by step.
+            if (_slots.empty()) _slots.reserve(_capacity);
+            const size_type before = _slots.size();
+            _slots.emplace_back(vm_detail::forward<Args>(args)...);
+            if (_slots.size() == before) return; // out of memory: reported by the vector
+        } else {
+            T value(vm_detail::forward<Args>(args)...);
+            _slots[tail] = vm_detail::move(value);
+        }
+        _count++;
+    }
+
+    /// Add an element at the back unless the buffer is full; false if it was.
+    bool try_push_back(const T& value) {
+        if (full()) return false;
+        const size_type before = _count;
+        push_back(value);
+        return _count != before;
+    }
+
+    /// Remove the oldest element.
+    void pop_front() {
+        vm_detail::KeepResident keep(this);
+        if (empty()) { VMManager::instance().fail(VMError::OutOfRange); return; }
+        _slots[_head] = T(); // release what it holds (a VMString's memory)
+        _head = next(_head);
+        _count--;
+        if (_count == 0) _head = 0;
+    }
+
+    /// Remove every element and give back the memory.
+    void clear() {
+        vm_detail::KeepResident keep(this);
+        _slots.clear();
+        _head = 0;
+        _count = 0;
+    }
+
+    void swap(VMRingBuffer& other) {
+        _slots.swap(other._slots);
+        vm_detail::swap(_capacity, other._capacity);
+        vm_detail::swap(_head, other._head);
+        vm_detail::swap(_count, other._count);
+    }
+
+private:
+    VMVector<T> _slots;     ///< Grows to capacity, then slots are reused.
+    size_type   _capacity;
+    size_type   _head = 0;  ///< Slot of the oldest element.
+    size_type   _count = 0;
+
+    size_type slot(size_type i) const { return _capacity == 0 ? 0 : (_head + i) % _capacity; }
+    size_type next(size_type s) const { return s + 1 == _capacity ? 0 : s + 1; }
+
+    bool in_range(size_type i) const {
+        if (i < _count) return true;
+        VMManager::instance().fail(VMError::OutOfRange);
+        return false;
     }
 };
 

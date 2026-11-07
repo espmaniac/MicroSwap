@@ -5,6 +5,7 @@ Virtual memory with a swap file, and STL-like containers on top of it, for Ardui
 MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an SD card or flash. Pages are loaded back automatically when you access them, and the least recently used page is written out to make room. An Arduino Uno can hold a `VMVector<long>` of thousands of elements while using about 0.7 KB of RAM.
 
 - `VMVector<T>`: vector, works with `std::sort` and other algorithms where the STL exists
+- `VMRingBuffer<T>`: ring buffer of the last N elements (sensor readings, logs), or a queue
 - `VMArray<T, N>`: fixed-size array
 - `VMString`: mutable string, of any length (a long one is stored in pages, like a vector)
 - `VMPtr<T>` + `make_vm<T>(...)`: one object in virtual memory
@@ -65,6 +66,7 @@ build_flags = -DVM_RESIDENT_PAGES=4
 | [Pin](examples/Pin/Pin.ino) | Keeping references and C strings valid with `VMPin`, and the pin limit |
 | [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
 | [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
+| [RingBuffer](examples/RingBuffer/RingBuffer.ino) | The last 2000 sensor readings in a `VMRingBuffer`: average, minimum, maximum, and use as a queue |
 | [SpiMemory](examples/SpiMemory/SpiMemory.ino) | Swapping to an SPI memory chip (23LC1024 SRAM, PSRAM, FRAM) with `VMSpiMemoryStorage` |
 | [CustomStorage](examples/CustomStorage/CustomStorage.ino) | A storage of your own on two functions, with `VMCustomStorage` |
 
@@ -531,6 +533,42 @@ public:
     bool operator>(const VMVector& other) const;
     bool operator<=(const VMVector& other) const;
     bool operator>=(const VMVector& other) const;
+};
+```
+
+### VMRingBuffer
+
+```cpp
+// The last capacity() elements pushed, oldest first; stored in a VMVector, so it can span pages.
+// Takes memory as elements are pushed (it can be a global), gives it back on clear().
+template<class T>
+class VMRingBuffer {
+public:
+    // value_type, reference, const_reference, size_type, difference_type,
+    // iterator, const_iterator, reverse_iterator, const_reverse_iterator (random-access)
+
+    explicit VMRingBuffer(size_type capacity);
+
+    reference       operator[](size_type i);       // 0 is the oldest
+    const_reference operator[](size_type i) const;
+    reference       at(size_type i);               // out of range -> VMError::OutOfRange
+    const_reference at(size_type i) const;
+    reference       front();                       // oldest
+    reference       back();                        // newest
+    iterator        begin(); iterator end();       // oldest to newest; also const, c- and r- versions
+
+    bool      empty() const;
+    bool      full() const;
+    size_type size() const;
+    size_type capacity() const;
+
+    void push_back(const T& value);                // when full, overwrites the oldest
+    void push_back(T&& value);
+    template<class... Args> void emplace_back(Args&&... args);
+    bool try_push_back(const T& value);            // false (and nothing changed) when full
+    void pop_front();                              // removes the oldest, resets its slot to T(); empty -> OutOfRange
+    void clear();                                  // removes everything and frees the memory
+    void swap(VMRingBuffer& other);
 };
 ```
 

@@ -564,6 +564,112 @@ static void test_long_string_random_edits() {
     CHECK(g_errors == 0);
 }
 
+// ---- VMRingBuffer ----
+
+static VMRingBuffer<long> g_global_ring(10); // constructed before the manager starts
+
+static void test_ring_order_and_overwrite() {
+    VMRingBuffer<long> r(5);
+    CHECK(r.empty() && !r.full() && r.capacity() == 5);
+    for (long i = 1; i <= 3; ++i) r.push_back(i);
+    CHECK(r.size() == 3 && r.front() == 1 && r.back() == 3 && r[1] == 2);
+    for (long i = 4; i <= 8; ++i) r.push_back(i); // 6, 7 and 8 overwrite 1, 2 and 3
+    CHECK(r.full() && r.size() == 5);
+    long want = 4;
+    int wrong = 0;
+    for (long v : r) wrong += v != want++;
+    CHECK(wrong == 0 && r.front() == 4 && r.back() == 8);
+    CHECK(!r.try_push_back(9) && r.back() == 8);
+
+    r.pop_front();
+    r.pop_front();
+    CHECK(r.size() == 3 && r.front() == 6 && r.back() == 8);
+    CHECK(r.try_push_back(9) && r.try_push_back(10) && r.full() && r.front() == 6 && r.back() == 10);
+    r[0] = 60;
+    CHECK(r.front() == 60);
+#if VM_USE_STL
+    CHECK(std::accumulate(r.begin(), r.end(), 0L) == 60 + 7 + 8 + 9 + 10);
+    CHECK(*std::max_element(r.begin(), r.end()) == 60);
+#endif
+    long reversed = 0;
+    for (auto it = r.rbegin(); it != r.rend(); ++it) reversed = reversed * 100 + *it;
+    CHECK(reversed == 1009080760L);
+
+    while (!r.empty()) r.pop_front();
+    CHECK(g_errors == 0);
+    r.pop_front();
+    CHECK(g_errors == 1 && vm().last_error() == VMError::OutOfRange);
+}
+
+static void test_ring_spans_pages() {
+    // Many pages of elements, wrapped around several times.
+    const size_t cap = vm_detail::min_of<size_t>(VM_PAGE_COUNT * VM_PAGE_SIZE / (3 * sizeof(long)), 3000);
+    VMRingBuffer<long> r(cap);
+    const long pushes = long(cap) * 3 + 17;
+    for (long i = 0; i < pushes; ++i) r.push_back(i);
+    CHECK(r.full() && r.size() == cap);
+    int wrong = 0;
+    for (size_t i = 0; i < cap; ++i) wrong += r[i] != pushes - long(cap) + long(i);
+    CHECK(wrong == 0);
+    for (size_t i = 0; i < cap / 2; ++i) r.pop_front();
+    for (long i = 0; i < 10; ++i) r.push_back(-i);
+    CHECK(r.back() == -9 && r.front() == pushes - long(cap) + long(cap / 2));
+    CHECK(used_pages() > 1);
+    r.clear();
+    CHECK(r.empty() && used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_ring_of_strings() {
+    VMRingBuffer<VMString> log(4);
+    char line[24];
+    for (int i = 0; i < 10; ++i) {
+        std::snprintf(line, sizeof(line), "line %d", i);
+        log.push_back(VMString(line));
+    }
+    CHECK(log.size() == 4 && log.front() == "line 6" && log.back() == "line 9");
+    log.pop_front();
+    log.pop_front();
+    CHECK(log.size() == 2 && log.front() == "line 8");
+    log.emplace_back("line 10");
+    CHECK(log.back() == "line 10" && log.size() == 3);
+    log.clear();
+    CHECK(used_pages() == 0);
+
+    // A popped element gives its memory back at once: long strings have pages of their own.
+    {
+        VMRingBuffer<VMString> big(3);
+        for (int i = 0; i < 3; ++i) big.push_back(VMString(VMString::max_flat_size() + 10, char('a' + i)));
+        const size_t full = used_pages();
+        big.pop_front();
+        big.pop_front();
+        CHECK(used_pages() < full);
+        CHECK(big.size() == 1 && big.front()[0] == 'c');
+    }
+    CHECK(g_errors == 0);
+}
+
+static void test_ring_copy_move_global() {
+    VMRingBuffer<long> a(3);
+    for (long i = 0; i < 5; ++i) a.push_back(i); // 2 3 4
+    VMRingBuffer<long> b = a;
+    a.push_back(5);                             // a: 3 4 5
+    CHECK(b.size() == 3 && b.front() == 2 && b.back() == 4);
+    CHECK(a.front() == 3 && a.back() == 5);
+    VMRingBuffer<long> c = static_cast<VMRingBuffer<long>&&>(b);
+    CHECK(c.front() == 2 && c.size() == 3);
+    c.swap(a);
+    CHECK(c.front() == 3 && a.front() == 2);
+
+    for (long i = 0; i < 25; ++i) g_global_ring.push_back(i);
+    CHECK(g_global_ring.size() == 10 && g_global_ring.front() == 15 && g_global_ring.back() == 24);
+    g_global_ring.clear();
+
+    VMRingBuffer<long> none(0);
+    none.push_back(1);
+    CHECK(none.empty() && g_errors == 1 && vm().last_error() == VMError::OutOfRange);
+}
+
 static void test_empty_string_uses_no_memory() {
     VMString s;
     CHECK(s.c_str()[0] == '\0');
@@ -1342,6 +1448,10 @@ int main() {
         {"VMString append self", test_vmstring_append_self},
         {"VMString too long", test_vmstring_too_long},
         {"empty string uses no memory", test_empty_string_uses_no_memory},
+        {"ring buffer: order and overwrite", test_ring_order_and_overwrite},
+        {"ring buffer: spans pages", test_ring_spans_pages},
+        {"ring buffer: strings", test_ring_of_strings},
+        {"ring buffer: copy, move, global", test_ring_copy_move_global},
         {"long string basics", test_long_string_basics},
         {"long string c_str reports", test_long_string_c_str_reports},
         {"long string edits", test_long_string_edits},

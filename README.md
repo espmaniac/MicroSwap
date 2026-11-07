@@ -111,6 +111,8 @@ The file must be opened for both reading and writing and must stay open:
 
 Do not use `FILE_WRITE` with the Arduino `SD` library: it appends every write to the end of the file.
 
+On an ESP32 the first `SD.begin()` after a reset can fail: the reset does not cut the card's power, and the card may still be in the middle of a command. Calling it again works, so the examples try up to three times. Many SD modules (HW-125 and alike) need 5 V on VCC, as they have their own 3.3 V regulator, and do not release MISO when the card is not selected: give such a module an SPI bus of its own. With long wires, keep the SPI clock at 10 MHz or less.
+
 Prefer an SD card over the board's internal flash (`LittleFS`, `SPIFFS`). Swapping rewrites the same pages over and over, and internal flash wears out after a limited number of writes. If you must use it, raise `VM_RESIDENT_PAGES` to swap less.
 
 To store pages somewhere else (external SPI RAM, FRAM, ...), implement `VMStorage`:
@@ -198,6 +200,8 @@ for (char c : log) Serial.write(c);            // works for any length
 ```
 
 A long string goes back to one block, with `c_str()`, when it is cleared, or on `shrink_to_fit()` once it fits.
+
+**Element types.** Pages are written to storage and read back byte by byte, and may come back to another place in RAM, so an object in virtual memory moves without its copy or move constructor being called. Store types whose bytes can be moved: numbers, structs, pointers to other memory, and MicroSwap's own containers. A type that points into itself breaks when its page moves: `std::string` of the GCC library (used on ESP32, RP2040, STM32 and Linux) keeps short strings in itself and points to them, and so do `std::function` and many classes with a small built-in buffer. On an ESP32, a `VMVector<std::string>` gave wrong strings and then crashed in `free()` once its pages had moved. Arduino `String` and `std::vector` can be moved, but their characters and elements stay in the normal heap, so they save no RAM: use `VMString` and `VMVector`.
 
 **Several tasks (ESP32, RP2040, FreeRTOS).** The library is not thread-safe, and two things matter when more than one task uses it:
 
@@ -658,6 +662,17 @@ VMString operator+(const VMString& a, const char* b);
 VMString operator+(const char* a, const VMString& b);
 ```
 
+## Tested on hardware
+
+Besides the host tests and the CI builds, the examples were run on real boards:
+
+| Board | Swap storage | Result |
+|---|---|---|
+| ESP32 (ESP32-D0WDQ6, Arduino core 2.x) | SD card, HW-125 module on VSPI | Every example correct with the ESP32 defaults and with 128-byte pages, 4 of them in RAM (constant swapping) |
+| ESP32 | LittleFS on the internal flash | The same |
+
+No resets or watchdog timeouts. Not run on a board yet: AVR (Uno, Mega), ESP8266.
+
 ## Running tests
 
 The library can be tested on a desktop machine without any board:
@@ -666,7 +681,7 @@ The library can be tested on a desktop machine without any board:
 make -C tests
 ```
 
-The tests are built twice, with sanitizers: once with the default configuration, and once in an AVR-like configuration (C++11, no STL, 128-byte pages, 3 resident pages) where pages are swapped constantly. GitHub Actions runs them and compiles the examples for every board listed above.
+The tests are built in four configurations, with sanitizers: the default one; two AVR-like ones (C++11, no STL, 128-byte pages, 4 resident pages), where pages are swapped constantly; and one where pins leave a single page free. GitHub Actions runs them and compiles the examples for every board listed above.
 
 ## Upgrading from earlier versions
 

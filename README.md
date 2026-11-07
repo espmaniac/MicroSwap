@@ -5,6 +5,7 @@ Virtual memory with a swap file, and STL-like containers on top of it, for Ardui
 MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an SD card or flash. Pages are loaded back automatically when you access them, and the least recently used page is written out to make room. An Arduino Uno can hold a `VMVector<long>` of thousands of elements while using about 0.7 KB of RAM.
 
 - `VMVector<T>`: vector, works with `std::sort` and other algorithms where the STL exists
+- `VMMap<Key, T>`: map sorted by key, like `std::map`
 - `VMRingBuffer<T>`: ring buffer of the last N elements (sensor readings, logs), or a queue
 - `VMArray<T, N>`: fixed-size array
 - `VMString`: mutable string, of any length (a long one is stored in pages, like a vector)
@@ -66,6 +67,7 @@ build_flags = -DVM_RESIDENT_PAGES=4
 | [Pin](examples/Pin/Pin.ino) | Keeping references and C strings valid with `VMPin`, and the pin limit |
 | [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
 | [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
+| [Map](examples/Map/Map.ino) | Counting words with a `VMMap<VMString, int>`, and a table by number: insert, update, erase, lookups by C string |
 | [RingBuffer](examples/RingBuffer/RingBuffer.ino) | The last 2000 sensor readings in a `VMRingBuffer`: average, minimum, maximum, and use as a queue |
 | [SpiMemory](examples/SpiMemory/SpiMemory.ino) | Swapping to an SPI memory chip (23LC1024 SRAM, PSRAM, FRAM) with `VMSpiMemoryStorage` |
 | [CustomStorage](examples/CustomStorage/CustomStorage.ino) | A storage of your own on two functions, with `VMCustomStorage` |
@@ -534,6 +536,46 @@ public:
     bool operator<=(const VMVector& other) const;
     bool operator>=(const VMVector& other) const;
 };
+```
+
+### VMMap
+
+```cpp
+// Entries VMPair<Key, T> kept sorted by key in a VMVector: lookups are a binary search,
+// inserting or erasing in the middle moves the entries after it (keys in ascending order are appended).
+// Suits tables read more than changed. Do not change an entry's first through an iterator.
+template<class Key, class T, class Compare = VMLess>   // VMLess: operator<, and VMString against C strings
+class VMMap {
+public:
+    // key_type, mapped_type, value_type (VMPair<Key, T>), size_type, difference_type,
+    // iterator, const_iterator, reverse_iterator, const_reverse_iterator (random-access, in key order)
+
+    // Lookups take any key comparable with Key: with VMString keys, find("name") allocates nothing.
+    template<class K> iterator  find(const K& key);            // end() if missing; also const
+    template<class K> bool      contains(const K& key) const;
+    template<class K> size_type count(const K& key) const;     // 0 or 1
+    template<class K> iterator  lower_bound(const K& key);     // first key not less than key; also const
+    template<class K> iterator  upper_bound(const K& key);     // first key greater than key; also const
+    template<class K> T&        at(const K& key);              // missing -> VMError::OutOfRange; also const
+    template<class K> T&        operator[](const K& key);      // inserts T() if missing
+
+    template<class K, class V> VMPair<iterator, bool> emplace(K&& key, V&& value);          // .second: inserted
+    template<class K, class V> VMPair<iterator, bool> insert(K&& key, V&& value);           // an existing key stays
+    VMPair<iterator, bool> insert(const value_type& entry);
+    template<class K, class V> VMPair<iterator, bool> insert_or_assign(K&& key, V&& value); // replaces an existing value
+    template<class K> size_type erase(const K& key);           // 0 or 1
+    iterator erase(iterator pos);
+    iterator erase(const_iterator pos);
+
+    bool      empty() const;
+    size_type size() const;
+    void      reserve(size_type n);
+    void      clear();                                         // frees the memory
+    void      swap(VMMap& other);
+    // begin(), end(), cbegin(), cend(), rbegin(), rend()
+};
+
+template<class A, class B> struct VMPair { A first; B second; };   // like std::pair
 ```
 
 ### VMRingBuffer

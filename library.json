@@ -63,6 +63,11 @@
       "files": ["Algorithms.ino", "Person.h", "SwapFile.h"]
     },
     {
+      "name": "Map",
+      "base": "examples/Map",
+      "files": ["Map.ino", "SwapFile.h"]
+    },
+    {
       "name": "RingBuffer",
       "base": "examples/RingBuffer",
       "files": ["RingBuffer.ino", "SwapFile.h"]

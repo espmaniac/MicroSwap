@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-07)
 
 First release as an Arduino / PlatformIO library. The core was rewritten, so code written for the earlier `containers.h` needs small changes (see "Upgrading" in the README).
 

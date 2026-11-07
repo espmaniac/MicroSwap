@@ -29,7 +29,17 @@ inline bool beginSwap(const char* path = "/swap.bin") {
     if (!SDFS.begin()) return false;
     swapFile = SDFS.open(path, "w+");
 #elif defined(ESP32)
-    if (!SD.begin(SD_CS_PIN)) return false;
+    // A reset that does not cut the card's power can leave it in the middle of
+    // a command, and the first SD.begin() then fails: try again.
+    bool mounted = false;
+    for (int attempt = 0; attempt < 3 && !mounted; ++attempt) {
+        mounted = SD.begin(SD_CS_PIN);
+        if (!mounted) {
+            SD.end();
+            delay(50);
+        }
+    }
+    if (!mounted) return false;
     swapFile = SD.open(path, "w+");
 #else
     if (!SD.begin(SD_CS_PIN)) return false;

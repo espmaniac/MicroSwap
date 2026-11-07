@@ -15,6 +15,9 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - `library.properties` and `library.json`; examples for every container, pinning, error handling, and custom storage.
 - `VM_YIELD()` hook, called after every page transfer: on ESP8266 it calls `yield()`, so long operations do not trip the watchdog.
 - Host tests (four configurations, sanitizers) and CI builds for 15 boards with Arduino CLI and 5 with PlatformIO.
+- Run on a real ESP32 with an SD card and with LittleFS (README, "Tested on hardware").
+- README: which element types can live in virtual memory (not `std::string` of the GCC library, or anything else that points into itself), and notes on SD modules.
+- The examples try `SD.begin()` up to three times on ESP32: the first one after a reset can fail.
 
 ### Changed
 - Include `<MicroSwap.h>` instead of `containers.h`.

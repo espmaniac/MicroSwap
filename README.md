@@ -6,7 +6,7 @@ MicroSwap keeps a few pages of data in RAM and stores the rest in a file on an S
 
 - `VMVector<T>`: vector, works with `std::sort` and other algorithms where the STL exists
 - `VMArray<T, N>`: fixed-size array
-- `VMString`: mutable string
+- `VMString`: mutable string, of any length (a long one is stored in pages, like a vector)
 - `VMPtr<T>` + `make_vm<T>(...)`: one object in virtual memory
 - `VMPin<T>`: keeps an object's page in RAM while you hold a reference to it
 
@@ -188,7 +188,18 @@ for (size_t i = 0; i < row.size(); ++i) total += row[i]; // fine
 
 An operation needs up to 4 resident pages at once. Deeper nesting, or an operation between two inner containers on different pages (copying or comparing `rows[1]` and `rows[3]`), can need one or two more. If there are not enough, the operation reports `VMError::TooManyPins` and, where it can, stops before changing anything; the default handler stops the program there. A handler that returns may see data corrupted in the cases the library cannot stop.
 
-**Limits.** A `VMString`, `VMArray` or `VMPtr` object must fit in one page (`VMString::max_size()` is `VM_PAGE_SIZE - 5` on AVR). `VMVector` elements must fit in one page each; the vector itself can span all pages.
+**Limits.** A `VMArray` or `VMPtr` object must fit in one page. `VMVector` elements must fit in one page each; the vector itself can span all pages.
+
+**Long strings.** A `VMString` of up to `VMString::max_flat_size()` characters (one page minus a few bytes: 123 on AVR, 4087 on ESP32) is stored in one block, and `c_str()` returns its characters. A longer one is stored in whole pages, like a large vector, so it can be longer than the RAM: every member works the same (`s[i]`, `+=`, `insert`, `find`, `compare`, iterators, `<algorithm>`), and pages are loaded as its characters are used. Only `c_str()` cannot work, because no single piece of memory holds all the characters: on a long string (`is_flat()` false) it reports `VMError::TooLarge` and returns `""`. Read a long string with `s[i]`, a loop over its characters or `copy()`:
+
+```cpp
+VMString log;                                  // grows past one page as lines are added
+log += line;
+if (log.find("ERROR") != VMString::npos) { ... }
+for (char c : log) Serial.write(c);            // works for any length
+```
+
+A long string goes back to one block, with `c_str()`, when it is cleared, or on `shrink_to_fit()` once it fits.
 
 **Element types.** Pages are written to storage and read back byte by byte, and may come back to another place in RAM, so an object in virtual memory moves without its copy or move constructor being called. Store types whose bytes can be moved: numbers, structs, pointers to other memory, and MicroSwap's own containers. A type that points into itself breaks when its page moves: `std::string` of the GCC library (used on ESP32, RP2040, STM32 and Linux) keeps short strings in itself and points to them, and so do `std::function` and many classes with a small built-in buffer. On an ESP32, a `VMVector<std::string>` gave wrong strings and then crashed in `free()` once its pages had moved. Arduino `String` and `std::vector` can be moved, but their characters and elements stay in the normal heap, so they save no RAM: use `VMString` and `VMVector`.
 
@@ -505,7 +516,8 @@ public:
 ### VMString
 
 ```cpp
-// Stored in one heap block: at most max_size() characters. An empty string uses no memory.
+// Up to max_flat_size() characters in one heap block (with c_str()); longer in whole pages.
+// An empty string uses no memory.
 class VMString {
 public:
     typedef char      value_type;
@@ -556,20 +568,22 @@ public:
     const_reference front() const;
     reference       back();
     const_reference back() const;
-    const char*     c_str() const;             // pointer into a resident page, see "Rules to follow"
+    const char*     c_str() const;             // pointer into a resident page, see "Rules to follow"; only while is_flat()
 
     // Capacity
     bool      empty() const;
     size_type size() const;
     size_type length() const;
     size_type capacity() const;
-    static constexpr size_type max_size();     // differs: one page minus a few bytes (123 on AVR)
-    void reserve(size_type new_cap);           // differs: beyond max_size() -> VMError::TooLarge
-    void shrink_to_fit();                      // differs: no-op
+    static constexpr size_type max_size();     // all virtual pages (VM_PAGE_COUNT * VM_PAGE_SIZE)
+    bool is_flat() const;                      // not in std::string: one block, so c_str() works
+    static constexpr size_type max_flat_size(); // not in std::string: longest string in one block (123 on AVR)
+    void reserve(size_type new_cap);           // beyond max_size() -> VMError::TooLarge
+    void shrink_to_fit();                      // frees unused pages; a long string that fits goes back to one block
     void resize(size_type n, char ch = '\0');
     void clear();
 
-    // Modifiers (growing beyond max_size() -> VMError::TooLarge, string unchanged)
+    // Modifiers (growing beyond max_size() -> VMError::TooLarge, string unchanged; running out of pages -> OutOfPages)
     void assign(const char* s);                // differs: returns void
     void assign(const char* s, size_type count);
     void assign(size_type count, char ch);

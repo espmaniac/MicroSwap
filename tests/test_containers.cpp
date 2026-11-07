@@ -327,7 +327,7 @@ static void test_heap_does_not_fragment() {
     // the heap would eat every page.
     for (int round = 0; round < 300; ++round) {
         VMString s;
-        const int len = (round * 7) % int(VMString::max_size());
+        const int len = (round * 7) % int(VMString::max_flat_size());
         for (int k = 0; k < len; ++k) s.push_back('x');
     }
     CHECK(used_pages() == 0);
@@ -386,6 +386,182 @@ static void test_vmstring_too_long() {
     s.resize(VMString::max_size() + 1, 'x');
     CHECK(vm().last_error() == VMError::TooLarge);
     CHECK(s.empty());
+}
+
+// ---- Strings longer than one block ----
+
+/// Length of a long string for this configuration: several pages, within the memory.
+static size_t long_length() {
+    return vm_detail::min_of<size_t>(3 * VMString::max_flat_size() + 37, VMString::max_size() / 4);
+}
+
+static bool same(const VMString& s, const std::string& want) {
+    if (s.size() != want.size()) return false;
+    for (size_t i = 0; i < want.size(); ++i)
+        if (s[i] != want[i]) return false;
+    return true;
+}
+
+static void test_long_string_basics() {
+    const size_t n = long_length();
+    std::string want;
+    VMString s;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = char('a' + i % 26);
+        s += c;
+        want += c;
+    }
+    CHECK(!s.is_flat());
+    CHECK(s.size() == n);
+    CHECK(same(s, want));
+    CHECK(s.capacity() >= n);
+    CHECK(g_errors == 0);
+
+    // Search across page boundaries.
+    const size_t at = VM_PAGE_SIZE - 2;
+    CHECK(s.find(want.substr(at, 5).c_str()) == want.find(want.substr(at, 5)));
+    CHECK(s.rfind("xyz") == want.rfind("xyz"));
+    CHECK(s.find('q', n / 2) == want.find('q', n / 2));
+    CHECK(s.find_first_of("!z") == want.find_first_of("!z"));
+    CHECK(s.find_last_not_of("z") == want.find_last_not_of("z"));
+    CHECK(s.find("not there") == VMString::npos);
+
+    // A short part comes back as a block, with c_str().
+    VMString part = s.substr(at, 10);
+    CHECK(part.is_flat());
+    CHECK(std::strcmp(part.c_str(), want.substr(at, 10).c_str()) == 0);
+    char buf[40];
+    CHECK(s.copy(buf, 30, n - 20) == 20);
+    CHECK(std::memcmp(buf, want.c_str() + n - 20, 20) == 0);
+
+    // Copies, comparisons, moves.
+    VMString t = s;
+    CHECK(!t.is_flat() && t == s && same(t, want));
+    t[n - 1] = '#';
+    CHECK(t != s && t < s && s > t); // '#' sorts before letters
+    CHECK(s.compare(want.c_str()) == 0);
+    VMString m = static_cast<VMString&&>(t);
+    CHECK(t.empty() && m.size() == n && m[n - 1] == '#');
+    m.swap(s);
+    CHECK(m[n - 1] != '#' && s[n - 1] == '#');
+
+    // Iterators reach every character.
+    size_t count = 0;
+    for (char c : m) count += c >= 'a' && c <= 'z';
+    CHECK(count == n);
+    CHECK(g_errors == 0);
+}
+
+static void test_long_string_c_str_reports() {
+    VMString s(VMString::max_flat_size() + 1, 'x');
+    CHECK(!s.is_flat());
+    CHECK(g_errors == 0);
+    const char* p = s.c_str();
+    CHECK(p[0] == '\0');
+    CHECK(g_errors == 1 && vm().last_error() == VMError::TooLarge);
+}
+
+static void test_long_string_edits() {
+    const size_t n = long_length();
+    std::string want(n, '.');
+    for (size_t i = 0; i < n; ++i) want[i] = char('A' + i % 23);
+    VMString s(want.c_str(), want.size());
+    CHECK(!s.is_flat() && same(s, want));
+
+    // Insert and erase in the middle shift characters across pages.
+    s.insert(5, "<inserted>");
+    want.insert(5, "<inserted>");
+    s.erase(VM_PAGE_SIZE - 3, VM_PAGE_SIZE + 7);
+    want.erase(VM_PAGE_SIZE - 3, VM_PAGE_SIZE + 7);
+    s.replace(10, 4, "-replaced-");
+    want.replace(10, 4, "-replaced-");
+    s.insert(s.size() / 2, 3, '*');
+    want.insert(want.size() / 2, 3, '*');
+    CHECK(same(s, want));
+
+    // Appending itself and a part of itself.
+    s.append(s);
+    want.append(want);
+    CHECK(same(s, want));
+    s.insert(1, s.substr(2, VM_PAGE_SIZE + 5));
+    want.insert(1, want.substr(2, VM_PAGE_SIZE + 5));
+    CHECK(same(s, want));
+    CHECK(g_errors == 0);
+}
+
+static void test_long_string_shrinks_back() {
+    VMString s(VMString::max_flat_size() * 2, 'y');
+    CHECK(!s.is_flat());
+    const size_t pages = used_pages();
+    s.erase(10);
+    CHECK(s.size() == 10 && !s.is_flat()); // stays in pages until asked
+    s.shrink_to_fit();
+    CHECK(s.is_flat() && std::strcmp(s.c_str(), "yyyyyyyyyy") == 0);
+    CHECK(used_pages() < pages);
+    s.resize(VMString::max_flat_size() * 2, 'z');
+    CHECK(!s.is_flat());
+    s.clear();
+    CHECK(s.empty() && s.is_flat() && used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_long_strings_inside_vector() {
+    // A few long strings as elements: their pages and the vector's come and go.
+    const int count = 3;
+    const size_t n = long_length() / 2;
+    VMVector<VMString> v;
+    for (int k = 0; k < count; ++k) {
+        v.emplace_back();
+        for (size_t i = 0; i < n; ++i) v[k] += char('0' + (i + k) % 10);
+    }
+    int wrong = 0;
+    for (int k = 0; k < count; ++k) {
+        if (v[k].size() != n || v[k].is_flat()) wrong++;
+        for (size_t i = 0; i < n; i += 7)
+            if (v[k][i] != char('0' + (i + k) % 10)) wrong++;
+    }
+    CHECK(wrong == 0);
+    CHECK(v[0] != v[1] && v[1].substr(0, n - 1) == v[0].substr(1, n - 1));
+    v.clear();
+    CHECK(used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_long_string_random_edits() {
+    // Random edits, checked against std::string after every step.
+    const size_t limit = long_length();
+    std::string want;
+    VMString s;
+    uint32_t seed = 12345;
+    int wrong = 0;
+    for (int step = 0; step < 300; ++step) {
+        seed = seed * 1103515245u + 12345u;
+        const size_t r = (seed >> 8) % 1000;
+        const size_t pos = want.empty() ? 0 : r % (want.size() + 1);
+        char piece[48];
+        const size_t len = 1 + (seed >> 20) % 40;
+        for (size_t i = 0; i < len; ++i) piece[i] = char('a' + (step + i) % 26);
+        switch ((seed >> 4) % 6) {
+            case 0: case 1:
+                if (want.size() + len <= limit) { s.insert(pos, piece, len); want.insert(pos, piece, len); }
+                break;
+            case 2:
+                s.erase(pos, len); want.erase(pos, vm_detail::min_of(len, want.size() - pos));
+                break;
+            case 3:
+                if (want.size() + len <= limit) { s.replace(pos, len / 2, piece, len); want.replace(pos, len / 2, piece, len); }
+                break;
+            case 4:
+                if (want.size() + len <= limit) { s.append(len, '#'); want.append(len, '#'); }
+                break;
+            default:
+                if (pos < want.size()) { s[pos] = '!'; want[pos] = '!'; }
+                break;
+        }
+        if (!same(s, want)) wrong++;
+    }
+    CHECK(wrong == 0);
+    CHECK(g_errors == 0);
 }
 
 static void test_empty_string_uses_no_memory() {
@@ -1166,6 +1342,12 @@ int main() {
         {"VMString append self", test_vmstring_append_self},
         {"VMString too long", test_vmstring_too_long},
         {"empty string uses no memory", test_empty_string_uses_no_memory},
+        {"long string basics", test_long_string_basics},
+        {"long string c_str reports", test_long_string_c_str_reports},
+        {"long string edits", test_long_string_edits},
+        {"long string shrinks back", test_long_string_shrinks_back},
+        {"long strings inside vector", test_long_strings_inside_vector},
+        {"long string random edits", test_long_string_random_edits},
         {"VMArray", test_vmarray},
         {"VMPtr", test_vmptr},
         {"storage write failure reports error", test_storage_write_failure_reports_error},

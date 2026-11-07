@@ -15,6 +15,7 @@ First release as an Arduino / PlatformIO library. The core was rewritten, so cod
 - `library.properties` and `library.json`; examples for every container, pinning, error handling, and custom storage.
 - `VM_YIELD()` hook, called after every page transfer: on ESP8266 it calls `yield()`, so long operations do not trip the watchdog.
 - Host tests (four configurations, sanitizers) and CI builds for 15 boards with Arduino CLI and 5 with PlatformIO.
+- `VMString` of any length up to `max_size()` (all virtual pages): a string longer than `max_flat_size()` is stored in whole pages and loaded as its characters are used, so it can be longer than the RAM. Every member works on it except `c_str()`, which needs one block (`is_flat()`); on a long string it reports `TooLarge` and returns `""`. `shrink_to_fit()` brings a long string that fits back to one block. About 1.7 KB more flash on an Uno, no more RAM.
 
 ### Changed
 - Include `<MicroSwap.h>` instead of `containers.h`.

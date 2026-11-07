@@ -1942,13 +1942,18 @@ private:
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Mutable string stored in one heap block.
+ * @brief Mutable string of any length up to max_size().
  *
- * The maximum length is max_size() (one page minus a few bytes). An empty
- * string uses no virtual memory.
+ * A string of at most max_flat_size() characters is stored in one heap block,
+ * like a small VMVector: c_str() returns its characters, null-terminated.
+ * A longer string is stored in whole pages, which are loaded as its
+ * characters are used, so it can be longer than the RAM; it has no c_str()
+ * (is_flat() is false), but every other member works the same. It goes back
+ * to one block when it is cleared or on shrink_to_fit() once it fits.
  *
  * c_str() and element references point into a resident page; see the note on
- * reference lifetime at the top of this file.
+ * reference lifetime at the top of this file. An empty string uses no
+ * virtual memory.
  */
 class VMString {
 public:
@@ -1972,7 +1977,7 @@ public:
     VMString(const char* s) { assign(s); }
     VMString(const char* s, size_type count) { assign(s, count); }
     VMString(size_type count, char ch) { assign(count, ch); }
-    VMString(const VMString& other) { const size_type n = other._size; assign(other.c_str(), n); }
+    VMString(const VMString& other) { replace_from(0, 0, other, 0, other._size); }
 
     VMString(VMString&& other) noexcept
         : _page(other._page), _offset(other._offset), _size(other._size), _capacity(other._capacity) {
@@ -1981,8 +1986,7 @@ public:
 
     VMString& operator=(const VMString& other) {
         if (this == &other) return *this;
-        const size_type n = other._size;
-        assign(other.c_str(), n);
+        replace_from(0, _size, other, 0, other._size);
         return *this;
     }
 
@@ -2021,8 +2025,8 @@ public:
 
     // -------------------- Element access --------------------
 
-    reference operator[](size_type i) { return in_range(i) ? buffer(vm_detail::Access::MayWrite)[i] : vm_detail::placeholder<char>(); }
-    const_reference operator[](size_type i) const { return in_range(i) ? buffer(vm_detail::Access::Read)[i] : vm_detail::placeholder<char>(); }
+    reference operator[](size_type i) { return in_range(i) ? *at_pos(i, vm_detail::Access::MayWrite) : vm_detail::placeholder<char>(); }
+    const_reference operator[](size_type i) const { return in_range(i) ? *at_pos(i, vm_detail::Access::Read) : vm_detail::placeholder<char>(); }
     reference at(size_type i) { return (*this)[i]; }
     const_reference at(size_type i) const { return (*this)[i]; }
     reference front() { return (*this)[0]; }
@@ -2030,8 +2034,16 @@ public:
     reference back() { return (*this)[_size - 1]; }
     const_reference back() const { return (*this)[_size - 1]; }
 
-    /// Null-terminated contents; valid until the page is evicted.
-    const char* c_str() const { return has_block() ? buffer(vm_detail::Access::Read) : ""; }
+    /**
+     * @brief Null-terminated contents; valid until the page is evicted.
+     *
+     * Only while is_flat(): a longer string reports TooLarge and returns "".
+     */
+    const char* c_str() const {
+        if (!has_block()) return "";
+        if (paged()) { VMManager::instance().fail(VMError::TooLarge); return ""; }
+        return buffer(vm_detail::Access::Read);
+    }
 
     // -------------------- Capacity --------------------
 
@@ -2040,13 +2052,28 @@ public:
     size_type length() const { return _size; }
     size_type capacity() const { return _capacity; }
 
-    /// Longest string that fits in one heap block.
-    static constexpr size_type max_size() { return vm_detail::kHeapMaxPayload - 1; }
+    /// True while the string is stored in one block, so c_str() is available.
+    bool is_flat() const { return !paged(); }
+
+    /// Longest string stored in one block, with c_str().
+    static constexpr size_type max_flat_size() { return vm_detail::kHeapMaxPayload - 1; }
+
+    /// Longest string: all virtual pages.
+    static constexpr size_type max_size() {
+        return (unsigned long long)VM_PAGE_COUNT * VM_PAGE_SIZE < (unsigned long long)(size_type(-1) - 1)
+                   ? size_type((unsigned long long)VM_PAGE_COUNT * VM_PAGE_SIZE)
+                   : size_type(size_type(-1) - 1);
+    }
 
     void reserve(size_type new_cap) { ensure_capacity(new_cap, new_cap); }
 
-    /// No-op: a string always uses a single block.
-    void shrink_to_fit() {}
+    /// Give back unused pages; a long string that now fits goes back to one block.
+    void shrink_to_fit() {
+        vm_detail::KeepResident keep(this);
+        if (!paged()) return;
+        if (_size <= max_flat_size()) to_flat();
+        else trim_chunks(chunks_for(_size));
+    }
 
     void resize(size_type n, char ch = '\0') {
         if (n < _size) erase(n);
@@ -2060,17 +2087,16 @@ public:
     void assign(const char* s) { assign(s, strlen(s)); }
     void assign(const char* s, size_type count) { replace(0, _size, s, count); }
     void assign(size_type count, char ch) {
-        if (char* gap = open_gap(0, _size, count)) memset(gap, ch, count);
+        if (open_gap(0, _size, count)) fill_chars(0, ch, count);
     }
     void assign(const VMString& other, size_type pos, size_type count = npos) {
         if (pos > other._size) { VMManager::instance().fail(VMError::OutOfRange); return; }
-        VMString part = other.substr(pos, count);
-        assign(part.c_str(), part._size);
+        replace_from(0, _size, other, pos, vm_detail::min_of(count, other._size - pos));
     }
 
     VMString& append(const char* s) { return append(s, strlen(s)); }
     VMString& append(const char* s, size_type count) { return replace(_size, 0, s, count); }
-    VMString& append(const VMString& other) { const size_type n = other._size; return append(other.c_str(), n); }
+    VMString& append(const VMString& other) { return replace_from(_size, 0, other, 0, other._size); }
     VMString& append(size_type count, char ch) { return insert(_size, count, ch); }
 
     void push_back(char c) { append(1, c); }
@@ -2086,9 +2112,9 @@ public:
 
     VMString& insert(size_type pos, const char* s) { return insert(pos, s, strlen(s)); }
     VMString& insert(size_type pos, const char* s, size_type count) { return replace(pos, 0, s, count); }
-    VMString& insert(size_type pos, const VMString& other) { const size_type n = other._size; return insert(pos, other.c_str(), n); }
+    VMString& insert(size_type pos, const VMString& other) { return replace_from(pos, 0, other, 0, other._size); }
     VMString& insert(size_type pos, size_type count, char ch) {
-        if (char* gap = open_gap(pos, 0, count)) memset(gap, ch, count);
+        if (open_gap(pos, 0, count)) fill_chars(pos, ch, count);
         return *this;
     }
 
@@ -2103,21 +2129,22 @@ public:
         if (points_into_buffer(s)) {
             // s would move or be overwritten while editing; work from a copy.
             VMString copy(s, s_count);
-            return replace(pos, count, copy.c_str(), s_count);
+            return replace_from(pos, count, copy, 0, s_count);
         }
-        if (char* gap = open_gap(pos, count, s_count)) memcpy(gap, s, s_count);
+        if (open_gap(pos, count, s_count)) write_chars(pos, s, s_count);
         return *this;
     }
     VMString& replace(size_type pos, size_type count, const char* s) { return replace(pos, count, s, strlen(s)); }
     VMString& replace(size_type pos, size_type count, const VMString& other) {
-        const size_type n = other._size;
-        return replace(pos, count, other.c_str(), n);
+        return replace_from(pos, count, other, 0, other._size);
     }
 
     VMString substr(size_type pos = 0, size_type count = npos) const {
         vm_detail::KeepResident keep(this);
-        if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return VMString(); }
-        return VMString(c_str() + pos, vm_detail::min_of(count, _size - pos));
+        VMString part;
+        if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return part; }
+        part.replace_from(0, 0, *this, pos, vm_detail::min_of(count, _size - pos));
+        return part;
     }
 
     /// Copy up to count characters starting at pos to dest (not null-terminated).
@@ -2125,7 +2152,7 @@ public:
         vm_detail::KeepResident keep(this, dest);
         if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return 0; }
         const size_type n = vm_detail::min_of(count, _size - pos);
-        memcpy(dest, c_str() + pos, n);
+        read_chars(pos, dest, n);
         return n;
     }
 
@@ -2141,53 +2168,88 @@ public:
     size_type find(const char* s, size_type pos, size_type count) const {
         vm_detail::KeepResident keep(this, s);
         if (count == 0) return pos <= _size ? pos : npos;
-        const char* b = c_str();
+        const char* b = flat_chars();
         for (size_type i = pos; i + count <= _size; ++i)
-            if (memcmp(b + i, s, count) == 0) return i;
+            if (b ? memcmp(b + i, s, count) == 0 : matches(i, s, count)) return i;
         return npos;
     }
     size_type find(const char* s, size_type pos = 0) const { return find(s, pos, strlen(s)); }
-    size_type find(const VMString& other, size_type pos = 0) const { const size_type n = other._size; return find(other.c_str(), pos, n); }
+    size_type find(const VMString& other, size_type pos = 0) const {
+        vm_detail::KeepResident keep(this, &other);
+        if (other._size == 0) return pos <= _size ? pos : npos;
+        for (size_type i = pos; i + other._size <= _size; ++i)
+            if (matches(i, other)) return i;
+        return npos;
+    }
     size_type find(char ch, size_type pos = 0) const { return find(&ch, pos, 1); }
 
     size_type rfind(const char* s, size_type pos, size_type count) const {
         vm_detail::KeepResident keep(this, s);
         if (count > _size) return npos;
-        const char* b = c_str();
+        const char* b = flat_chars();
         for (size_type i = vm_detail::min_of(pos, _size - count) + 1; i-- > 0;)
-            if (memcmp(b + i, s, count) == 0) return i;
+            if (b ? memcmp(b + i, s, count) == 0 : matches(i, s, count)) return i;
         return npos;
     }
     size_type rfind(const char* s, size_type pos = npos) const { return rfind(s, pos, strlen(s)); }
-    size_type rfind(const VMString& other, size_type pos = npos) const { const size_type n = other._size; return rfind(other.c_str(), pos, n); }
+    size_type rfind(const VMString& other, size_type pos = npos) const {
+        vm_detail::KeepResident keep(this, &other);
+        if (other._size > _size) return npos;
+        for (size_type i = vm_detail::min_of(pos, _size - other._size) + 1; i-- > 0;)
+            if (matches(i, other)) return i;
+        return npos;
+    }
     size_type rfind(char ch, size_type pos = npos) const { return rfind(&ch, pos, 1); }
 
-    size_type find_first_of(const char* s, size_type pos = 0) const { return find_forward(s, pos, true); }
-    size_type find_first_of(const VMString& other, size_type pos = 0) const { return find_first_of(other.c_str(), pos); }
+    size_type find_first_of(const char* s, size_type pos = 0) const { return find_forward(s, strlen(s), pos, true); }
+    size_type find_first_of(const VMString& other, size_type pos = 0) const { return find_forward(other, pos, true); }
     size_type find_first_of(char ch, size_type pos = 0) const { return find(ch, pos); }
 
-    size_type find_first_not_of(const char* s, size_type pos = 0) const { return find_forward(s, pos, false); }
-    size_type find_first_not_of(const VMString& other, size_type pos = 0) const { return find_first_not_of(other.c_str(), pos); }
-    size_type find_first_not_of(char ch, size_type pos = 0) const { const char s[2] = {ch, '\0'}; return find_first_not_of(s, pos); }
+    size_type find_first_not_of(const char* s, size_type pos = 0) const { return find_forward(s, strlen(s), pos, false); }
+    size_type find_first_not_of(const VMString& other, size_type pos = 0) const { return find_forward(other, pos, false); }
+    size_type find_first_not_of(char ch, size_type pos = 0) const { return find_forward(&ch, 1, pos, false); }
 
-    size_type find_last_of(const char* s, size_type pos = npos) const { return find_backward(s, pos, true); }
-    size_type find_last_of(const VMString& other, size_type pos = npos) const { return find_last_of(other.c_str(), pos); }
+    size_type find_last_of(const char* s, size_type pos = npos) const { return find_backward(s, strlen(s), pos, true); }
+    size_type find_last_of(const VMString& other, size_type pos = npos) const { return find_backward(other, pos, true); }
     size_type find_last_of(char ch, size_type pos = npos) const { return rfind(ch, pos); }
 
-    size_type find_last_not_of(const char* s, size_type pos = npos) const { return find_backward(s, pos, false); }
-    size_type find_last_not_of(const VMString& other, size_type pos = npos) const { return find_last_not_of(other.c_str(), pos); }
-    size_type find_last_not_of(char ch, size_type pos = npos) const { const char s[2] = {ch, '\0'}; return find_last_not_of(s, pos); }
+    size_type find_last_not_of(const char* s, size_type pos = npos) const { return find_backward(s, strlen(s), pos, false); }
+    size_type find_last_not_of(const VMString& other, size_type pos = npos) const { return find_backward(other, pos, false); }
+    size_type find_last_not_of(char ch, size_type pos = npos) const { return find_backward(&ch, 1, pos, false); }
 
     // -------------------- Comparison --------------------
 
     int compare(const char* s, size_type s_len) const {
         vm_detail::KeepResident keep(this, s);
-        const int r = memcmp(c_str(), s, vm_detail::min_of(_size, s_len));
+        const size_type n = vm_detail::min_of(_size, s_len);
+        int r = 0;
+        for (size_type done = 0; done < n && r == 0;) {
+            size_type run = 0;
+            const char* p = span(done, vm_detail::Access::Read, run);
+            run = vm_detail::min_of(run, n - done);
+            r = memcmp(p, s + done, run);
+            done += run;
+        }
         if (r != 0) return r;
         return _size == s_len ? 0 : (_size < s_len ? -1 : 1);
     }
     int compare(const char* s) const { return compare(s, strlen(s)); }
-    int compare(const VMString& other) const { const size_type n = other._size; return compare(other.c_str(), n); }
+    int compare(const VMString& other) const {
+        // A block is one run of characters, compared as a C string would be.
+        if (!other.paged()) { const size_type n = other._size; return compare(other.c_str(), n); }
+        vm_detail::KeepResident keep(this, &other);
+        const size_type n = vm_detail::min_of(_size, other._size);
+        char mine[kChunkCopy];
+        char theirs[kChunkCopy];
+        for (size_type done = 0; done < n; done += kChunkCopy) {
+            const size_type part = vm_detail::min_of<size_type>(kChunkCopy, n - done);
+            read_chars(done, mine, part);
+            other.read_chars(done, theirs, part);
+            const int r = memcmp(mine, theirs, part);
+            if (r != 0) return r;
+        }
+        return _size == other._size ? 0 : (_size < other._size ? -1 : 1);
+    }
 
     bool operator==(const VMString& other) const { return compare(other) == 0; }
     bool operator!=(const VMString& other) const { return compare(other) != 0; }
@@ -2199,16 +2261,129 @@ public:
     bool operator!=(const char* s) const { return compare(s) != 0; }
 
 private:
+    /// _offset of a string stored in pages; no heap block starts there.
+    static const uint16_t kPaged = 0xFFFF;
+    /// Characters moved at a time between pages, through a buffer on the stack.
+    enum : size_type { kChunkCopy = 16 };
+
+    // One block: _page, _offset and _capacity of the block. In pages (_offset
+    // == kPaged): _page is the first page, the rest follow through the page
+    // table, and _capacity is the pages times VM_PAGE_SIZE.
     uint16_t  _page = vm_detail::kNoPage;
     uint16_t  _offset = 0;
     size_type _size = 0;
-    size_type _capacity = 0; ///< Characters that fit, excluding the terminator.
+    size_type _capacity = 0; ///< Characters that fit, excluding the terminator of a block.
 
     bool has_block() const { return _page != vm_detail::kNoPage; }
+    bool paged() const { return _offset == kPaged; }
+    uint16_t chunk_count() const { return paged() ? uint16_t(_capacity / VM_PAGE_SIZE) : 0; }
+    static uint16_t chunks_for(size_type n) { return uint16_t((n + VM_PAGE_SIZE - 1) / VM_PAGE_SIZE); }
 
     char* buffer(vm_detail::Access access) const {
         VMManager::instance().touch(this);
         return static_cast<char*>(VMManager::instance().block_ptr(_page, _offset, access));
+    }
+
+    /// Page k of a paged string; walks the page table in RAM.
+    uint16_t chunk_at(uint16_t k) const {
+        const VMManager& mgr = VMManager::instance();
+        uint16_t page = _page;
+        while (k-- > 0) page = mgr.next_chunk(page);
+        return page;
+    }
+
+    /// Character pos, and in run how many characters follow it in the same memory.
+    char* span(size_type pos, vm_detail::Access access, size_type& run) const {
+        if (!paged()) {
+            run = _capacity + 1 - pos;
+            return buffer(access) + pos;
+        }
+        VMManager& mgr = VMManager::instance();
+        mgr.touch(this);
+        run = VM_PAGE_SIZE - pos % VM_PAGE_SIZE;
+        return reinterpret_cast<char*>(mgr.page_ptr(chunk_at(uint16_t(pos / VM_PAGE_SIZE)), access)) + pos % VM_PAGE_SIZE;
+    }
+
+    char* at_pos(size_type i, vm_detail::Access access) const {
+        size_type run = 0;
+        return span(i, access, run);
+    }
+
+    char char_at(size_type i) const { return *at_pos(i, vm_detail::Access::Read); }
+
+    /// The characters of a block, for loops that read them in place; nullptr for a paged string.
+    const char* flat_chars() const { return !paged() && has_block() ? buffer(vm_detail::Access::Read) : nullptr; }
+
+    void read_chars(size_type pos, char* out, size_type n) const {
+        while (n > 0) {
+            size_type run = 0;
+            const char* p = span(pos, vm_detail::Access::Read, run);
+            run = vm_detail::min_of(run, n);
+            memcpy(out, p, run);
+            out += run;
+            pos += run;
+            n -= run;
+        }
+    }
+
+    void write_chars(size_type pos, const char* in, size_type n) {
+        while (n > 0) {
+            size_type run = 0;
+            char* p = span(pos, vm_detail::Access::Write, run);
+            run = vm_detail::min_of(run, n);
+            memcpy(p, in, run);
+            in += run;
+            pos += run;
+            n -= run;
+        }
+    }
+
+    void fill_chars(size_type pos, char ch, size_type n) {
+        while (n > 0) {
+            size_type run = 0;
+            char* p = span(pos, vm_detail::Access::Write, run);
+            run = vm_detail::min_of(run, n);
+            memset(p, ch, run);
+            pos += run;
+            n -= run;
+        }
+    }
+
+    /// Move n characters from src to dst within the string; the ranges may overlap.
+    void move_chars(size_type dst, size_type src, size_type n) {
+        if (n == 0 || dst == src) return;
+        char tmp[kChunkCopy];
+        if (dst < src) {
+            for (size_type done = 0; done < n; done += kChunkCopy) {
+                const size_type part = vm_detail::min_of<size_type>(kChunkCopy, n - done);
+                read_chars(src + done, tmp, part);
+                write_chars(dst + done, tmp, part);
+            }
+        } else {
+            for (size_type left = n; left > 0;) {
+                const size_type part = vm_detail::min_of<size_type>(kChunkCopy, left);
+                left -= part;
+                read_chars(src + left, tmp, part);
+                write_chars(dst + left, tmp, part);
+            }
+        }
+    }
+
+    bool matches(size_type i, const char* s, size_type count) const {
+        for (size_type done = 0; done < count;) {
+            size_type run = 0;
+            const char* p = span(i + done, vm_detail::Access::Read, run);
+            run = vm_detail::min_of(run, count - done);
+            if (memcmp(p, s + done, run) != 0) return false;
+            done += run;
+        }
+        return true;
+    }
+
+    bool matches(size_type i, const VMString& other) const {
+        for (size_type k = 0; k < other._size; ++k)
+            if (char_at(i + k) != other.char_at(k)) return false;
+        return true;
     }
 
     bool in_range(size_type i) const {
@@ -2217,8 +2392,10 @@ private:
         return false;
     }
 
+    /// Whether s points into this string, or for a paged string into any page in RAM.
     bool points_into_buffer(const char* s) const {
         if (!has_block()) return false;
+        if (paged()) return VMManager::instance().frame_of(s) != vm_detail::kNoFrame;
         const char* b = buffer(vm_detail::Access::Read);
         return s >= b && s <= b + _capacity;
     }
@@ -2232,8 +2409,90 @@ private:
 
     void release() {
         vm_detail::KeepResident keep(this);
-        if (has_block()) VMManager::instance().heap_free(_page, _offset);
+        if (paged()) free_chain(_page);
+        else if (has_block()) VMManager::instance().heap_free(_page, _offset);
         forget_block();
+    }
+
+    /// Free a page and every page after it in the chain.
+    static void free_chain(uint16_t page) {
+        VMManager& mgr = VMManager::instance();
+        while (page != vm_detail::kNoPage) {
+            // Read the link before freeing: free_page() clears the entry.
+            const uint16_t next = mgr.next_chunk(page);
+            mgr.free_page(page);
+            page = next;
+        }
+    }
+
+    /// Add pages after last until there are count; false (the chain as far as it got) if one is missing.
+    static bool extend_chain(uint16_t& first, uint16_t last, uint16_t have, uint16_t count) {
+        VMManager& mgr = VMManager::instance();
+        for (; have < count; ++have) {
+            const uint16_t page = mgr.alloc_page();
+            if (page == vm_detail::kNoPage) return false;
+            mgr.set_next_chunk(page, vm_detail::kNoPage);
+            if (first == vm_detail::kNoPage) first = page;
+            else mgr.set_next_chunk(last, page);
+            last = page;
+        }
+        return true;
+    }
+
+    /// Free the pages after the first keep.
+    void trim_chunks(uint16_t keep) {
+        if (keep == 0 || keep >= chunk_count()) return;
+        VMManager& mgr = VMManager::instance();
+        const uint16_t last = chunk_at(uint16_t(keep - 1));
+        const uint16_t rest = mgr.next_chunk(last);
+        mgr.set_next_chunk(last, vm_detail::kNoPage);
+        free_chain(rest);
+        _capacity = size_type(keep) * VM_PAGE_SIZE;
+    }
+
+    /// Move a block's characters to whole pages, enough for needed.
+    bool to_paged(size_type needed) {
+        VMManager& mgr = VMManager::instance();
+        // Copying holds the block and a page at once.
+        if (_size > 0 && !mgr.have_working_pages(2)) return false;
+        // Allocate first, so a failure leaves the string untouched.
+        uint16_t first = vm_detail::kNoPage;
+        if (!extend_chain(first, vm_detail::kNoPage, 0, chunks_for(needed))) {
+            free_chain(first);
+            return false;
+        }
+        uint16_t page = first;
+        for (size_type done = 0; done < _size; done += VM_PAGE_SIZE) {
+            char* dst = reinterpret_cast<char*>(mgr.page_ptr(page, vm_detail::Access::Write));
+            vm_detail::KeepResident hold(dst);
+            memcpy(dst, buffer(vm_detail::Access::Read) + done, vm_detail::min_of<size_type>(VM_PAGE_SIZE, _size - done));
+            page = mgr.next_chunk(page);
+        }
+        if (has_block()) mgr.heap_free(_page, _offset);
+        _page = first;
+        _offset = kPaged;
+        _capacity = size_type(chunks_for(needed)) * VM_PAGE_SIZE;
+        return true;
+    }
+
+    /// Move a paged string that fits back into one block (c_str() again); stays paged if it cannot.
+    void to_flat() {
+        VMManager& mgr = VMManager::instance();
+        if (!mgr.have_working_pages(2)) return;
+        uint16_t page = vm_detail::kNoPage;
+        uint16_t offset = 0;
+        size_t usable = 0;
+        if (!mgr.heap_alloc(_size + 1, page, offset, usable)) return;
+        char* dst = static_cast<char*>(mgr.block_ptr(page, offset, vm_detail::Access::Write));
+        {
+            vm_detail::KeepResident hold(dst);
+            read_chars(0, dst, _size);
+            dst[_size] = '\0';
+        }
+        free_chain(_page);
+        _page = page;
+        _offset = offset;
+        _capacity = vm_detail::min_of<size_type>(usable - 1, max_flat_size());
     }
 
     /**
@@ -2245,7 +2504,19 @@ private:
         if (has_block() && needed <= _capacity) return true;
         if (needed > max_size()) { VMManager::instance().fail(VMError::TooLarge); return false; }
 
-        const size_type new_cap = vm_detail::min_of(vm_detail::max_of(wanted, needed), max_size());
+        if (paged()) {
+            const uint16_t have = chunk_count();
+            uint16_t first = _page;
+            const bool ok = extend_chain(first, chunk_at(uint16_t(have - 1)), have, chunks_for(needed));
+            // Pages added before a failure stay: the capacity counts them.
+            uint16_t count = 0;
+            for (uint16_t p = _page; p != vm_detail::kNoPage; p = VMManager::instance().next_chunk(p)) ++count;
+            _capacity = size_type(count) * VM_PAGE_SIZE;
+            return ok;
+        }
+        if (needed > max_flat_size()) return to_paged(needed);
+
+        const size_type new_cap = vm_detail::min_of(vm_detail::max_of(wanted, needed), max_flat_size());
         VMManager& mgr = VMManager::instance();
         if (!mgr.have_working_pages(has_block() ? 2 : 1)) return false; // old and new block
         uint16_t page = vm_detail::kNoPage;
@@ -2260,50 +2531,85 @@ private:
         if (has_block()) mgr.heap_free(_page, _offset);
         _page = page;
         _offset = offset;
-        _capacity = vm_detail::min_of<size_type>(usable - 1, max_size());
+        _capacity = vm_detail::min_of<size_type>(usable - 1, max_flat_size());
         return true;
     }
 
     /**
      * @brief Replace `count` characters at `pos` with an uninitialized gap of `gap_len` characters.
-     * @return Pointer to the gap (valid until the page is evicted), or nullptr on failure.
+     * @return False on failure, the string unchanged.
      */
-    char* open_gap(size_type pos, size_type count, size_type gap_len) {
+    bool open_gap(size_type pos, size_type count, size_type gap_len) {
         vm_detail::KeepResident keep(this);
-        if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return nullptr; }
+        if (pos > _size) { VMManager::instance().fail(VMError::OutOfRange); return false; }
         count = vm_detail::min_of(count, _size - pos);
 
         const size_type new_size = _size - count + gap_len;
-        if (new_size == 0 && !has_block()) return nullptr; // stays empty
-        if (!ensure_capacity(new_size, _capacity + _capacity / 2)) return nullptr;
+        if (new_size == 0 && !has_block()) return true; // stays empty
+        if (new_size == 0 && paged()) { release(); return true; }
+        if (!ensure_capacity(new_size, _capacity + _capacity / 2)) return false;
 
-        char* b = buffer(vm_detail::Access::Write);
-        // Shift the tail, including the terminator.
-        memmove(b + pos + gap_len, b + pos + count, _size - pos - count + 1);
+        const size_type tail = _size - pos - count;
+        if (paged()) {
+            move_chars(pos + gap_len, pos + count, tail);
+        } else {
+            char* b = buffer(vm_detail::Access::Write);
+            // Shift the tail, including the terminator.
+            memmove(b + pos + gap_len, b + pos + count, tail + 1);
+        }
         _size = new_size;
-        return b + pos;
+        return true;
     }
 
-    /// True if c is one of the characters of set. Unlike strchr, '\0' never matches.
-    static bool in_set(const char* set, size_t set_len, char c) {
-        return memchr(set, c, set_len) != nullptr;
+    /// Replace count characters at pos with n characters of src from src_pos.
+    VMString& replace_from(size_type pos, size_type count, const VMString& src, size_type src_pos, size_type n) {
+        if (n == 0) return replace(pos, count, "", 0);
+        // A block is one run of characters: replace() pins it and copies it
+        // when it is this string's own.
+        if (!src.paged()) return replace(pos, count, src.buffer(vm_detail::Access::Read) + src_pos, n);
+        vm_detail::KeepResident keep(this, &src);
+        if (&src == this) {
+            // The characters would move while being copied; work from a copy.
+            VMString part = substr(src_pos, n);
+            return replace_from(pos, count, part, 0, part._size);
+        }
+        if (!open_gap(pos, count, n)) return *this;
+        char tmp[kChunkCopy];
+        for (size_type done = 0; done < n; done += kChunkCopy) {
+            const size_type part = vm_detail::min_of<size_type>(kChunkCopy, n - done);
+            src.read_chars(src_pos + done, tmp, part);
+            write_chars(pos + done, tmp, part);
+        }
+        return *this;
     }
 
-    size_type find_forward(const char* set, size_type pos, bool want_in_set) const {
+    size_type find_forward(const char* set, size_t set_len, size_type pos, bool want_in_set) const {
         vm_detail::KeepResident keep(this, set);
-        const size_t set_len = strlen(set);
-        const char* b = c_str();
+        const char* b = flat_chars();
         for (size_type i = pos; i < _size; ++i)
-            if (in_set(set, set_len, b[i]) == want_in_set) return i;
+            if ((memchr(set, b ? b[i] : char_at(i), set_len) != nullptr) == want_in_set) return i;
         return npos;
     }
 
-    size_type find_backward(const char* set, size_type pos, bool want_in_set) const {
+    size_type find_backward(const char* set, size_t set_len, size_type pos, bool want_in_set) const {
         vm_detail::KeepResident keep(this, set);
-        const size_t set_len = strlen(set);
-        const char* b = c_str();
+        const char* b = flat_chars();
         for (size_type i = vm_detail::min_of(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
-            if (in_set(set, set_len, b[i]) == want_in_set) return i;
+            if ((memchr(set, b ? b[i] : char_at(i), set_len) != nullptr) == want_in_set) return i;
+        return npos;
+    }
+
+    size_type find_forward(const VMString& set, size_type pos, bool want_in_set) const {
+        vm_detail::KeepResident keep(this, &set);
+        for (size_type i = pos; i < _size; ++i)
+            if ((set.find(char_at(i)) != npos) == want_in_set) return i;
+        return npos;
+    }
+
+    size_type find_backward(const VMString& set, size_type pos, bool want_in_set) const {
+        vm_detail::KeepResident keep(this, &set);
+        for (size_type i = vm_detail::min_of(pos, _size - 1) + 1; _size > 0 && i-- > 0;)
+            if ((set.find(char_at(i)) != npos) == want_in_set) return i;
         return npos;
     }
 };

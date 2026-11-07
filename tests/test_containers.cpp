@@ -15,6 +15,7 @@ static unsigned long g_yields = 0;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -668,6 +669,128 @@ static void test_ring_copy_move_global() {
     VMRingBuffer<long> none(0);
     none.push_back(1);
     CHECK(none.empty() && g_errors == 1 && vm().last_error() == VMError::OutOfRange);
+}
+
+// ---- VMMap ----
+
+static void test_map_basics() {
+    VMMap<long, long> m;
+    CHECK(m.empty());
+    CHECK(m.insert(5L, 50L).second && m.insert(1L, 10L).second && m.insert(3L, 30L).second);
+    CHECK(!m.insert(3L, 99L).second && m.at(3) == 30); // an existing key stays
+    CHECK(m.size() == 3 && m.begin()->first == 1 && (m.end() - 1)->first == 5);
+    long order = 0;
+    for (const VMPair<long, long>& e : m) order = order * 10 + e.first;
+    CHECK(order == 135);
+    CHECK(m.find(3) != m.end() && m.find(3)->second == 30 && m.find(4) == m.end());
+    CHECK(m.contains(5) && !m.contains(2) && m.count(1) == 1 && m.count(2) == 0);
+    CHECK(m.lower_bound(2)->first == 3 && m.lower_bound(3)->first == 3 && m.upper_bound(3)->first == 5);
+    CHECK(m.upper_bound(5) == m.end() && m.lower_bound(0) == m.begin());
+
+    m[4] = 40;   // inserts
+    m[1] += 1;   // updates
+    CHECK(m.size() == 4 && m.at(4) == 40 && m.at(1) == 11);
+    CHECK(!m.insert_or_assign(4L, 44L).second && m.at(4) == 44);
+    CHECK(m.insert_or_assign(2L, 20L).second && m.size() == 5);
+
+    CHECK(m.erase(3) == 1 && m.erase(3) == 0 && m.size() == 4);
+    m.erase(m.begin());
+    CHECK(m.begin()->first == 2);
+    CHECK(g_errors == 0);
+    (void)m.at(100);
+    CHECK(g_errors == 1 && vm().last_error() == VMError::OutOfRange);
+}
+
+static void test_map_string_keys() {
+    VMMap<VMString, int> words;
+    const char* text[] = {"pear", "apple", "fig", "apple", "kiwi", "pear", "apple"};
+    for (const char* w : text) words[w]++;
+    CHECK(words.size() == 4);
+    CHECK(words.at("apple") == 3 && words.at("pear") == 2 && words.at("fig") == 1);
+    CHECK(words.begin()->first == "apple" && (words.end() - 1)->first == "pear");
+    CHECK(words.contains("kiwi") && !words.contains("plum"));
+    CHECK(words.find(VMString("fig"))->second == 1);
+    // Looking up by a C string makes no VMString: with the memory full, where
+    // any allocation would fail, lookups still work and report nothing.
+    {
+        std::vector<VMPtr<char>> filler;
+        for (;;) {
+            VMPtr<char> p = make_vm<char>('x');
+            if (!p) break;
+            filler.push_back(p);
+        }
+        CHECK(g_errors > 0); // the filling ran out
+        g_errors = 0;
+        int found = 0;
+        for (int i = 0; i < 20; ++i) found += words.find("kiwi") != words.end();
+        found += words.contains("apple") + int(words.count("pear")) + (words.lower_bound("b")->first == "fig");
+        CHECK(found == 23 && g_errors == 0);
+        for (VMPtr<char>& p : filler) p.destroy();
+    }
+    CHECK(words.erase("fig") == 1 && words.size() == 3);
+    words.clear();
+    CHECK(used_pages() == 0);
+    CHECK(g_errors == 0);
+}
+
+static void test_map_against_std_map() {
+    // Random inserts, updates and erases over many pages, checked against std::map.
+    const long keys = long(vm_detail::min_of<size_t>(VM_PAGE_COUNT * VM_PAGE_SIZE / (4 * sizeof(VMPair<long, long>)), 1500));
+    VMMap<long, long> m;
+    std::map<long, long> want;
+    uint32_t seed = 7;
+    for (int step = 0; step < 3000; ++step) {
+        seed = seed * 1103515245u + 12345u;
+        const long key = long((seed >> 8) % uint32_t(keys));
+        switch ((seed >> 4) % 4) {
+            case 0: case 1: m[key] = step; want[key] = step; break;
+            case 2: CHECK(m.erase(key) == want.erase(key)); break;
+            default: CHECK(m.insert(key, long(-step)).second == want.insert(std::make_pair(key, long(-step))).second); break;
+        }
+    }
+    CHECK(m.size() == want.size());
+    int wrong = 0;
+    auto it = want.begin();
+    for (const VMPair<long, long>& e : m) {
+        if (it == want.end() || e.first != it->first || e.second != it->second) wrong++;
+        if (it != want.end()) ++it;
+    }
+    CHECK(wrong == 0);
+    for (long k = 0; k < keys; k += 7) CHECK(m.contains(k) == (want.count(k) == 1));
+    CHECK(g_errors == 0);
+}
+
+static void test_map_ascending_and_nested() {
+    // Keys in ascending order are appended: the common way to build a table.
+    // Two copies at once must fit in this configuration's virtual memory.
+    const long n = long(vm_detail::min_of<size_t>(500, VM_PAGE_COUNT * VM_PAGE_SIZE / (4 * sizeof(VMPair<long, long>))));
+    {
+        VMMap<long, long> m;
+        m.reserve(size_t(n));
+        for (long k = 0; k < n; ++k) m.insert(k * 2, k);
+        CHECK(m.size() == size_t(n) && m.at((n - 1) * 2) == n - 1 && !m.contains(1));
+        VMMap<long, long> copy = m;
+        copy[1] = -1;
+        CHECK(copy.size() == size_t(n) + 1 && m.size() == size_t(n));
+        VMMap<long, long> moved = static_cast<VMMap<long, long>&&>(copy);
+        CHECK(moved.at(1) == -1 && copy.empty());
+        moved.swap(m);
+        CHECK(m.size() == size_t(n) + 1 && moved.size() == size_t(n));
+    }
+    CHECK(used_pages() == 0);
+
+    // Maps inside a vector.
+    VMVector<VMMap<long, VMString>> tables;
+    for (int t = 0; t < 3; ++t) {
+        tables.emplace_back();
+        for (long k = 0; k < 20; ++k) {
+            char name[16];
+            std::snprintf(name, sizeof(name), "t%d-%ld", t, k);
+            tables[t].insert(k, VMString(name));
+        }
+    }
+    CHECK(tables[2].at(19) == "t2-19" && tables[0].at(0) == "t0-0" && tables[1].size() == 20);
+    CHECK(g_errors == 0);
 }
 
 static void test_empty_string_uses_no_memory() {
@@ -1452,6 +1575,10 @@ int main() {
         {"ring buffer: spans pages", test_ring_spans_pages},
         {"ring buffer: strings", test_ring_of_strings},
         {"ring buffer: copy, move, global", test_ring_copy_move_global},
+        {"map: basics", test_map_basics},
+        {"map: string keys, C string lookups", test_map_string_keys},
+        {"map: random edits against std::map", test_map_against_std_map},
+        {"map: ascending inserts, copy, move, maps in a vector", test_map_ascending_and_nested},
         {"long string basics", test_long_string_basics},
         {"long string c_str reports", test_long_string_c_str_reports},
         {"long string edits", test_long_string_edits},

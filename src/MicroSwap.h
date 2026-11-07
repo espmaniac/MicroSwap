@@ -425,6 +425,7 @@ template<typename T> class VMPtr;
 template<typename T> class VMPin;
 template<typename T> class VMVector;
 template<typename T> class VMRingBuffer;
+template<typename Key, typename T, typename Compare> class VMMap;
 template<typename T, size_t N> class VMArray;
 class VMString;
 
@@ -514,6 +515,7 @@ private:
     friend class vm_detail::KeepResident;
     template<typename T> friend class ::VMVector;
     template<typename T> friend class ::VMRingBuffer;
+    template<typename Key, typename T, typename Compare> friend class ::VMMap;
     template<typename T, size_t N> friend class ::VMArray;
     friend class ::VMString;
     template<typename T, typename... Args> friend VMPtr<T> make_vm(Args&&... args);
@@ -2818,3 +2820,248 @@ inline VMString operator+(const char* a, const VMString& b) {
     r.append(b);
     return r;
 }
+
+// -----------------------------------------------------------------------------
+// VMMap
+// -----------------------------------------------------------------------------
+
+/// Two values, like std::pair (which AVR does not have).
+template<typename A, typename B>
+struct VMPair {
+    A first;
+    B second;
+
+    VMPair() : first(), second() {}
+    template<typename A2, typename B2>
+    VMPair(A2&& a, B2&& b) : first(vm_detail::forward<A2>(a)), second(vm_detail::forward<B2>(b)) {}
+};
+
+namespace vm_detail {
+template<typename A, typename B>
+inline bool key_less(const A& a, const B& b) { return a < b; }
+// A VMString key compared with a C string, without making a VMString of it.
+inline bool key_less(const VMString& a, const char* b) { return a.compare(b) < 0; }
+inline bool key_less(const char* a, const VMString& b) { return b.compare(a) > 0; }
+} // namespace vm_detail
+
+/// The default order of VMMap keys: operator<, and VMString against C strings.
+struct VMLess {
+    template<typename A, typename B>
+    bool operator()(const A& a, const B& b) const { return vm_detail::key_less(a, b); }
+};
+
+/**
+ * @brief Map from keys to values, sorted by key, like std::map.
+ *
+ * The entries are VMPair<Key, T>, kept sorted in a VMVector, so the map
+ * spans pages like a vector and a lookup is a binary search: about log2(n)
+ * entries are read. Inserting or erasing in the middle moves the entries
+ * after it, so the map suits tables that are read more than changed; keys
+ * inserted in ascending order are appended without moving anything.
+ *
+ * Do not change an entry's `first` through an iterator: the order would
+ * break. With VMString keys, find("name") and the other lookups compare
+ * with the C string directly, without allocating.
+ */
+template<typename Key, typename T, typename Compare = VMLess>
+class VMMap {
+public:
+    typedef Key key_type;
+    typedef T mapped_type;
+    typedef VMPair<Key, T> value_type;
+    typedef size_t size_type;
+    typedef ptrdiff_t difference_type;
+    typedef Compare key_compare;
+
+    using iterator               = typename VMVector<value_type>::iterator;
+    using const_iterator         = typename VMVector<value_type>::const_iterator;
+    using reverse_iterator       = typename VMVector<value_type>::reverse_iterator;
+    using const_reverse_iterator = typename VMVector<value_type>::const_reverse_iterator;
+
+    VMMap() {}
+    explicit VMMap(const Compare& less) : _less(less) {}
+
+    // -------------------- Iterators (in key order) --------------------
+
+    iterator begin() { return _items.begin(); }
+    iterator end() { return _items.end(); }
+    const_iterator begin() const { return _items.begin(); }
+    const_iterator end() const { return _items.end(); }
+    const_iterator cbegin() const { return _items.begin(); }
+    const_iterator cend() const { return _items.end(); }
+    reverse_iterator rbegin() { return _items.rbegin(); }
+    reverse_iterator rend() { return _items.rend(); }
+    const_reverse_iterator rbegin() const { return _items.rbegin(); }
+    const_reverse_iterator rend() const { return _items.rend(); }
+
+    // -------------------- Capacity --------------------
+
+    bool empty() const { return _items.empty(); }
+    size_type size() const { return _items.size(); }
+    void reserve(size_type n) { _items.reserve(n); }
+    void clear() { _items.clear(); }
+
+    // -------------------- Lookup --------------------
+
+    template<typename K>
+    iterator find(const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        const size_type i = lower(key);
+        return found_at(i, key) ? begin() + difference_type(i) : end();
+    }
+
+    template<typename K>
+    const_iterator find(const K& key) const {
+        vm_detail::KeepResident keep(this, &key);
+        const size_type i = lower(key);
+        return found_at(i, key) ? begin() + difference_type(i) : end();
+    }
+
+    template<typename K>
+    bool contains(const K& key) const {
+        vm_detail::KeepResident keep(this, &key);
+        return found_at(lower(key), key);
+    }
+
+    template<typename K>
+    size_type count(const K& key) const { return contains(key) ? 1 : 0; }
+
+    /// First entry whose key is not less than key.
+    template<typename K>
+    iterator lower_bound(const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        return begin() + difference_type(lower(key));
+    }
+
+    template<typename K>
+    const_iterator lower_bound(const K& key) const {
+        vm_detail::KeepResident keep(this, &key);
+        return begin() + difference_type(lower(key));
+    }
+
+    /// First entry whose key is greater than key.
+    template<typename K>
+    iterator upper_bound(const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        return begin() + difference_type(upper(key));
+    }
+
+    template<typename K>
+    const_iterator upper_bound(const K& key) const {
+        vm_detail::KeepResident keep(this, &key);
+        return begin() + difference_type(upper(key));
+    }
+
+    /// The value of key; a missing key reports VMError::OutOfRange.
+    template<typename K>
+    T& at(const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        const size_type i = lower(key);
+        if (found_at(i, key)) return _items[i].second;
+        VMManager::instance().fail(VMError::OutOfRange);
+        return vm_detail::placeholder<T>();
+    }
+
+    template<typename K>
+    const T& at(const K& key) const {
+        vm_detail::KeepResident keep(this, &key);
+        const size_type i = lower(key);
+        if (found_at(i, key)) return _items[i].second;
+        VMManager::instance().fail(VMError::OutOfRange);
+        return vm_detail::placeholder<T>();
+    }
+
+    /// The value of key, inserting T() first if it is missing.
+    template<typename K>
+    T& operator[](const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        const VMPair<iterator, bool> r = emplace(key, T());
+        if (r.first == end()) return vm_detail::placeholder<T>(); // out of memory: reported
+        return r.first->second;
+    }
+
+    // -------------------- Modifiers --------------------
+
+    /// Insert key with value unless the key is there; .second is true if it was inserted.
+    template<typename K, typename V>
+    VMPair<iterator, bool> emplace(K&& key, V&& value) {
+        vm_detail::KeepResident keep(this, &key, &value);
+        const size_type i = lower(key);
+        if (found_at(i, key)) return VMPair<iterator, bool>(begin() + difference_type(i), false);
+        const size_type before = _items.size();
+        if (i == before) _items.emplace_back(vm_detail::forward<K>(key), vm_detail::forward<V>(value));
+        else _items.insert(begin() + difference_type(i), value_type(vm_detail::forward<K>(key), vm_detail::forward<V>(value)));
+        if (_items.size() == before) return VMPair<iterator, bool>(end(), false); // out of memory: reported
+        return VMPair<iterator, bool>(begin() + difference_type(i), true);
+    }
+
+    VMPair<iterator, bool> insert(const value_type& entry) { return emplace(entry.first, entry.second); }
+
+    template<typename K, typename V>
+    VMPair<iterator, bool> insert(K&& key, V&& value) {
+        return emplace(vm_detail::forward<K>(key), vm_detail::forward<V>(value));
+    }
+
+    /// Insert key with value, or give an existing key this value; .second is true if it was inserted.
+    template<typename K, typename V>
+    VMPair<iterator, bool> insert_or_assign(K&& key, V&& value) {
+        vm_detail::KeepResident keep(this, &key, &value);
+        const size_type i = lower(key);
+        if (found_at(i, key)) {
+            T copy(vm_detail::forward<V>(value));
+            _items[i].second = vm_detail::move(copy);
+            return VMPair<iterator, bool>(begin() + difference_type(i), false);
+        }
+        return emplace(vm_detail::forward<K>(key), vm_detail::forward<V>(value));
+    }
+
+    /// Remove key; returns how many entries were removed (0 or 1).
+    template<typename K>
+    size_type erase(const K& key) {
+        vm_detail::KeepResident keep(this, &key);
+        const size_type i = lower(key);
+        if (!found_at(i, key)) return 0;
+        _items.erase(begin() + difference_type(i));
+        return 1;
+    }
+
+    // Both, so that erase(m.begin()) is not taken for a key.
+    iterator erase(iterator pos) { return _items.erase(pos); }
+    iterator erase(const_iterator pos) { return _items.erase(pos); }
+
+    void swap(VMMap& other) {
+        _items.swap(other._items);
+        vm_detail::swap(_less, other._less);
+    }
+
+private:
+    VMVector<value_type> _items;
+    Compare _less;
+
+    template<typename K>
+    size_type lower(const K& key) const {
+        size_type lo = 0;
+        size_type hi = _items.size();
+        while (lo < hi) {
+            const size_type mid = lo + (hi - lo) / 2;
+            if (_less(_items[mid].first, key)) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    template<typename K>
+    size_type upper(const K& key) const {
+        size_type lo = 0;
+        size_type hi = _items.size();
+        while (lo < hi) {
+            const size_type mid = lo + (hi - lo) / 2;
+            if (_less(key, _items[mid].first)) hi = mid;
+            else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    template<typename K>
+    bool found_at(size_type i, const K& key) const { return i < _items.size() && !_less(key, _items[i].first); }
+};

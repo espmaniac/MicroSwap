@@ -7,7 +7,9 @@ on:
 jobs:
   compile:
     name: ${{ matrix.board.fqbn }}
-    runs-on: ubuntu-latest
+    # arduino/compile-sketches@v1 installs Python 3.12.4, which has no build
+    # for Ubuntu 26.04 (now ubuntu-latest).
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

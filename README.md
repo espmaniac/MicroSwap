@@ -65,10 +65,10 @@ build_flags = -DVM_RESIDENT_PAGES=4
 | [Pin](examples/Pin/Pin.ino) | Keeping references and C strings valid with `VMPin`, and the pin limit |
 | [ErrorHandling](examples/ErrorHandling/ErrorHandling.ino) | A custom error handler and every kind of error |
 | [Algorithms](examples/Algorithms/Algorithms.ino) | `std::sort`, `std::accumulate`, `std::transform` on containers (not on AVR) |
-| [SpiSram](examples/SpiSram/SpiSram.ino) | Swapping to an SPI SRAM chip (23LC1024 and alike) with `VMSpiSramStorage` |
-| [CustomStorage](examples/CustomStorage/CustomStorage.ino) | Writing a storage of your own by implementing `VMStorage` |
+| [SpiMemory](examples/SpiMemory/SpiMemory.ino) | Swapping to an SPI memory chip (23LC1024 SRAM, PSRAM, FRAM) with `VMSpiMemoryStorage` |
+| [CustomStorage](examples/CustomStorage/CustomStorage.ino) | A storage of your own on two functions, with `VMCustomStorage` |
 
-All examples except SpiSram and CustomStorage put the swap file on an SD card, through `SwapFile.h` in the example's folder. Set `SD_CS_PIN` there to your card's chip select pin.
+All examples except SpiMemory and CustomStorage put the swap file on an SD card, through `SwapFile.h` in the example's folder. Set `SD_CS_PIN` there to your card's chip select pin.
 
 ## Quick start
 
@@ -116,24 +116,57 @@ On an ESP32 the first `SD.begin()` after a reset can fail: the reset does not cu
 
 Prefer an SD card over the board's internal flash (`LittleFS`, `SPIFFS`). Swapping rewrites the same pages over and over, and internal flash wears out after a limited number of writes. If you must use it, raise `VM_RESIDENT_PAGES` to swap less.
 
-### SPI SRAM instead of a file
+### SPI memory chips instead of a file
 
-An SPI SRAM chip is a good place for swapped pages: it needs no file system and no SD library, it is faster than a card, and it does not wear out. Its contents are lost at power-off, which does not matter for swapping. `MicroSwapSpiSram.h` has a storage for Microchip's 23LC1024 / 23A1024 (128 KB), 23LC512 / 23A512 (64 KB), 23K256 (32 KB) and 23K640 (8 KB):
+An SPI memory chip is a good place for swapped pages: it needs no file system and no SD library, it is faster than a card, and SRAM, PSRAM, FRAM and MRAM do not wear out. `MicroSwapSpiMemory.h` has a storage for them; pick your chip from `VMSpiChips`:
 
 ```cpp
-#include <MicroSwapSpiSram.h>
+#include <MicroSwapSpiMemory.h>
 
-VMSpiSramStorage sram(10);           // chip select pin; then capacity (default 131072), SPI clock (8 MHz), SPIClass
+VMSpiMemoryStorage memory(10, VMSpiChips::LC1024);   // chip select pin, chip; then SPI clock (8 MHz), SPIClass
 
 void setup() {
-    if (!sram.begin()) { /* no chip, or it is smaller than declared */ }
-    VMManager::instance().begin(sram);
+    if (!memory.begin()) { /* no chip, smaller than described, or the virtual memory does not fit */ }
+    VMManager::instance().begin(memory);
 }
 ```
 
-`begin()` switches the chip to sequential mode and checks that it answers, that it really holds the declared capacity (a smaller chip mirrors its first half), and that the virtual memory (`VM_PAGE_SIZE * VM_PAGE_COUNT`) fits. Chips above 64 KB get 24-bit addresses, the others 16-bit ones. The chip shares the SPI bus with other devices: each transfer takes the bus with its own settings and chip select.
+| `VMSpiChips::` | Chip | Size |
+|---|---|---|
+| `LC1024` | Microchip 23LC1024 / 23A1024 SRAM | 128 KB |
+| `LC512` | Microchip 23LC512 / 23A512 SRAM | 64 KB |
+| `K256`, `K640` | Microchip 23K256, 23K640 SRAM | 32 KB, 8 KB |
+| `APS6404` | APS6404L / ESP-PSRAM64H / LY68L6400 PSRAM (3.3 V) | 8 MB |
+| `MB85RS64V` | Fujitsu MB85RS64V FRAM | 8 KB |
+| `FM25V10` | Infineon FM25V10 FRAM | 128 KB |
 
-To store pages somewhere else (FRAM, EEPROM, another chip, ...), implement `VMStorage`:
+The descriptions come from the datasheets; so far the storage is tested against simulated chips only (see "Tested on hardware").
+
+**A chip that is not in the list.** Describe it: chips differ only in a few numbers, so no code is needed for one that reads and writes by address like these:
+
+```cpp
+// capacity, address bytes, max clock, flags, max chip-select time (us), page bytes,
+// read command, write command, dummy bytes after a read's address
+const VMSpiChip myChip(65536UL, 2, 20000000UL, kVMSpiWriteEnable);
+VMSpiMemoryStorage memory(10, myChip);
+```
+
+Flags: `kVMSpiModeRegister` (set sequential mode at start, Microchip SRAM), `kVMSpiWriteEnable` (write enable before every write, FRAM and MRAM), `kVMSpiReset` (reset at start, PSRAM). PSRAM also needs its chip-select time (8 µs) and page size (1 KB): transfers are split to respect both, so a faster SPI clock makes it faster.
+
+`begin()` checks that the description is valid, that the chip answers, that it really holds the described capacity (a smaller chip mirrors its first half) and that the virtual memory (`VM_PAGE_SIZE * VM_PAGE_COUNT`) fits. The chip shares the SPI bus with other devices: each transfer takes the bus with its own settings and chip select. Flash and EEPROM chips are not for swapping: they need erasing or slow page writes, and they wear out.
+
+### Storage of your own
+
+For any other memory, give MicroSwap two functions with `VMCustomStorage`:
+
+```cpp
+bool chipRead(void* context, uint32_t offset, uint8_t* buf, size_t len)        { /* ... */ return true; }
+bool chipWrite(void* context, uint32_t offset, const uint8_t* buf, size_t len) { /* ... */ return true; }
+
+VMCustomStorage storage(chipRead, chipWrite);   // optional: context passed to both, flush function
+```
+
+or implement `VMStorage`:
 
 ```cpp
 class MyStorage : public VMStorage {
@@ -309,6 +342,30 @@ public:
     bool read(uint32_t offset, uint8_t* buf, size_t len) override;
     bool write(uint32_t offset, const uint8_t* buf, size_t len) override;
     bool flush() override;   // file.flush()
+};
+
+// Storage on two functions of your own (and optionally a flush function).
+class VMCustomStorage : public VMStorage {
+public:
+    typedef bool (*ReadFunction)(void* context, uint32_t offset, uint8_t* buf, size_t len);
+    typedef bool (*WriteFunction)(void* context, uint32_t offset, const uint8_t* buf, size_t len);
+    typedef bool (*FlushFunction)(void* context);
+    VMCustomStorage(ReadFunction read, WriteFunction write, void* context = nullptr, FlushFunction flush = nullptr);
+};
+
+// MicroSwapSpiMemory.h: storage on an SPI memory chip.
+struct VMSpiChip {
+    constexpr VMSpiChip(uint32_t capacity, uint8_t address_bytes, uint32_t max_clock_hz, uint8_t flags = 0,
+                        uint16_t max_select_us = 0, uint16_t page_bytes = 0, uint8_t read_command = 0x03,
+                        uint8_t write_command = 0x02, uint8_t read_dummy_bytes = 0);
+};
+namespace VMSpiChips { /* LC1024, LC512, K256, K640, APS6404, MB85RS64V, FM25V10 */ }
+class VMSpiMemoryStorage : public VMStorage {
+public:
+    VMSpiMemoryStorage(uint8_t cs_pin, const VMSpiChip& chip, uint32_t clock_hz = 0, SPIClass& spi = SPI);
+    bool begin();                  // false: bad description, no chip, smaller than described, too small
+    const VMSpiChip& chip() const;
+    uint32_t capacity() const;
 };
 ```
 
@@ -689,7 +746,7 @@ Besides the host tests and the CI builds, the examples were run on real boards:
 | ESP32 (ESP32-D0WDQ6, Arduino core 2.x) | SD card, HW-125 module on VSPI | Every example correct with the ESP32 defaults and with 128-byte pages, 4 of them in RAM (constant swapping) |
 | ESP32 | LittleFS on the internal flash | The same |
 
-`VMSpiSramStorage` is tested against a simulated chip (commands, addresses, chip select), not yet on a real one.
+`VMSpiMemoryStorage` is tested against simulated chips of each family (commands, addresses, chip select, write enable, PSRAM pages and chip-select time), not yet on real ones.
 
 No resets or watchdog timeouts. Not run on a board yet: AVR (Uno, Mega), ESP8266.
 

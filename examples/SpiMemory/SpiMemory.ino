@@ -7,7 +7,7 @@
 // select on SRAM_CS_PIN, VCC 2.5-5.5 V (23LC1024; 23K256 takes 2.7-3.6 V).
 
 // The chip holds 128 KB, so the virtual memory must not be larger:
-// VM_PAGE_SIZE * VM_PAGE_COUNT <= 131072. AVR's defaults (128 * 64) fit;
+// VM_PAGE_SIZE * VM_PAGE_COUNT <= 131072. AVR's defaults (128 * 48) fit;
 // on other boards use 128 pages of 1 KB. Must come before the include.
 #if !defined(__AVR__)
 #define VM_PAGE_SIZE  1024

@@ -88,6 +88,15 @@ static void test_psram() {
     for (uint32_t clock : {8000000UL, 33000000UL}) {
         psram(clock);
         VMSpiMemoryStorage memory(g_chip.cs_pin, VMSpiChips::APS6404, clock);
+        if (clock == 33000000UL) {
+            // The extended grade's 3 us leave fewer bytes per chip select, still within the limit.
+            g_chip.max_data_per_select = 3 * clock / 8000000 - 4;
+            VMSpiMemoryStorage extended(g_chip.cs_pin, VMSpiChips::APS6404X, clock);
+            CHECK(extended.begin());
+            CHECK(swap_through(extended) == 0);
+            CHECK(g_chip.faults() == 0);
+            psram(clock);
+        }
         CHECK(memory.begin());
         CHECK(g_chip.resets == 1);
         CHECK(swap_through(memory) == 0);

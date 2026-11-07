@@ -1,8 +1,8 @@
 {
   "name": "MicroSwap",
   "version": "0.2.0",
-  "description": "Virtual memory with a swap file and STL-like containers (vector, array, string, pointer) for boards with little RAM. Keeps a few pages in RAM and swaps the rest to an SD card or other storage.",
-  "keywords": ["virtual memory", "swap", "sd", "vector", "string", "containers", "memory"],
+  "description": "Vectors, strings, maps and ring buffers bigger than your board's RAM: keeps a few pages in RAM and swaps the rest to an SD card, an SPI memory chip (SRAM, PSRAM, FRAM) or flash by itself. Works like the standard containers; no malloc, no exceptions.",
+  "keywords": ["virtual memory", "swap", "sd", "sram", "psram", "fram", "vector", "string", "map", "ring buffer", "containers", "memory"],
   "repository": {
     "type": "git",
     "url": "https://github.com/espmaniac/MicroSwap.git"

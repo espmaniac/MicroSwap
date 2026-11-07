@@ -63,6 +63,11 @@
       "files": ["Algorithms.ino", "Person.h", "SwapFile.h"]
     },
     {
+      "name": "RingBuffer",
+      "base": "examples/RingBuffer",
+      "files": ["RingBuffer.ino", "SwapFile.h"]
+    },
+    {
       "name": "SpiMemory",
       "base": "examples/SpiMemory",
       "files": ["SpiMemory.ino"]

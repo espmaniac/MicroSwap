@@ -1,5 +1,6 @@
 // Swapping to an external SPI SRAM chip instead of an SD card, by
-// implementing VMStorage (see SpiRamStorage.h).
+// implementing VMStorage (see SpiRamStorage.h): how to write a storage of
+// your own. For these chips MicroSwap has one ready, see the SpiSram example.
 //
 // Wiring: 23LC1024 on the board's default SPI pins, chip select on SRAM_CS_PIN.
 

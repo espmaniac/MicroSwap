@@ -24,11 +24,17 @@ AVR_FLAGS = -std=c++11 -g $(WARNINGS) $(SANITIZE) \
             -DVM_USE_STL=0 -DVM_PAGE_SIZE=128 -DVM_RESIDENT_PAGES=4 \
             -DVM_PAGE_COUNT=64 -DVM_HEAP_ALIGN=8 -DVM_TICK_BITS=16
 
-test: test_default test_small test_scarce test_avr
+# VMSpiSramStorage against a simulated chip, C++11, with pages swapped constantly.
+SPI_SRAM_FLAGS = -std=c++11 -g $(WARNINGS) $(SANITIZE) -Ifake_arduino \
+                 -DVM_USE_STL=0 -DVM_PAGE_SIZE=128 -DVM_RESIDENT_PAGES=4 \
+                 -DVM_PAGE_COUNT=64 -DVM_HEAP_ALIGN=8
+
+test: test_default test_small test_scarce test_avr test_spi_sram
 	./test_default
 	./test_small
 	./test_scarce
 	./test_avr
+	./test_spi_sram
 
 test_default: test_containers.cpp ../src/MicroSwap.h
 	$(CXX) $(DEFAULT_FLAGS) -o $@ test_containers.cpp
@@ -42,7 +48,10 @@ test_scarce: test_containers.cpp ../src/MicroSwap.h
 test_avr: test_containers.cpp ../src/MicroSwap.h
 	$(CXX) $(AVR_FLAGS) -o $@ test_containers.cpp
 
+test_spi_sram: test_spi_sram.cpp fake_arduino/fake_arduino.cpp fake_arduino/*.h ../src/MicroSwap.h ../src/MicroSwapSpiSram.h
+	$(CXX) $(SPI_SRAM_FLAGS) -o $@ test_spi_sram.cpp fake_arduino/fake_arduino.cpp
+
 clean:
-	rm -rf test_default test_small test_scarce test_avr test_containers *.dSYM
+	rm -rf test_default test_small test_scarce test_avr test_spi_sram test_containers *.dSYM
 
 .PHONY: test clean

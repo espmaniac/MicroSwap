@@ -3,3 +3,4 @@ tests/test_small
 tests/*.dSYM
 tests/test_scarce
 tests/test_avr
+tests/test_spi_sram
